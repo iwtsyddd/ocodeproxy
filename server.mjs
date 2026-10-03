@@ -348,7 +348,7 @@ function zenResponsesRequest(targetModel, messages, _stream, tools, tool_choice,
   };
 }
 
-const CHAT_MODELS = [
+const DEFAULT_CHAT_MODELS = [
   "deepseek-v4-flash-free",
   "big-pickle",
   "space-bunny-free",
@@ -362,7 +362,7 @@ const CHAT_MODELS = [
   "fledge-alpha-free",
 ];
 
-const RESPONSES_MODELS = [
+const DEFAULT_RESPONSES_MODELS = [
   "muse-spark-1.3-contributor-free",
   "muse-spark-1.3",
   "muse-spark-1.2-contributor-free",
@@ -378,8 +378,11 @@ const DISCONTINUED_MODELS = new Set([
   "jev-1.13-free",
 ]);
 
-const ALL_MODELS = [...CHAT_MODELS, ...RESPONSES_MODELS];
-const RESPONSES_SET = new Set(RESPONSES_MODELS);
+let CHAT_MODELS = [...DEFAULT_CHAT_MODELS];
+let RESPONSES_MODELS = [...DEFAULT_RESPONSES_MODELS];
+let ALL_MODELS = [...CHAT_MODELS, ...RESPONSES_MODELS];
+let RESPONSES_SET = new Set(RESPONSES_MODELS);
+let lastModelsFetchTime = 0;
 
 function isDeprecatedModel(model) {
   return DISCONTINUED_MODELS.has(model);
@@ -390,7 +393,95 @@ function resolveModel(model) {
 }
 
 function isResponsesModel(model) {
-  return RESPONSES_SET.has(resolveModel(model));
+  const resolved = resolveModel(model);
+  return RESPONSES_SET.has(resolved) || resolved.startsWith("muse-spark");
+}
+
+function isKnownModel(model) {
+  const resolved = resolveModel(model);
+  return ALL_MODELS.includes(model) || ALL_MODELS.includes(resolved);
+}
+
+function fetchUpstreamModels() {
+  return new Promise((resolve) => {
+    const headers = {
+      "Authorization": `Bearer ${ZEN_AUTH_MODE}`,
+      "User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/${AI_SDK_VER} runtime/bun/${BUN_VER}`,
+      "x-opencode-client": OPENCODE_CLIENT,
+      "x-opencode-project": OPENCODE_PROJECT,
+      "Accept": "application/json",
+    };
+
+    const req = https.request({
+      hostname: "opencode.ai",
+      port: 443,
+      path: "/zen/v1/models",
+      method: "GET",
+      headers,
+      timeout: 15000,
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          if (res.statusCode !== 200) {
+            return resolve(null);
+          }
+          const parsed = JSON.parse(data);
+          const list = Array.isArray(parsed?.data) ? parsed.data : [];
+          if (!list.length) return resolve(null);
+
+          const discoveredIds = list.map((m) => m.id).filter(Boolean);
+          const freeIds = discoveredIds.filter(
+            (id) => (id.includes("free") || id === "big-pickle" || id.startsWith("muse-spark")) && !DISCONTINUED_MODELS.has(id)
+          );
+
+          if (!freeIds.length) return resolve(null);
+
+          const newResponses = [];
+          const newChat = [];
+          for (const id of freeIds) {
+            if (id.startsWith("muse-spark")) {
+              newResponses.push(id);
+            } else {
+              newChat.push(id);
+            }
+          }
+
+          for (const m of DEFAULT_RESPONSES_MODELS) {
+            if (!newResponses.includes(m) && !DISCONTINUED_MODELS.has(m)) newResponses.push(m);
+          }
+          for (const m of DEFAULT_CHAT_MODELS) {
+            if (!newChat.includes(m) && !DISCONTINUED_MODELS.has(m)) newChat.push(m);
+          }
+
+          resolve({ chat: newChat, responses: newResponses });
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+async function refreshModels(silent = false) {
+  const result = await fetchUpstreamModels();
+  if (result) {
+    CHAT_MODELS = result.chat;
+    RESPONSES_MODELS = result.responses;
+    ALL_MODELS = [...CHAT_MODELS, ...RESPONSES_MODELS];
+    RESPONSES_SET = new Set(RESPONSES_MODELS);
+    lastModelsFetchTime = Date.now();
+    if (!silent) {
+      console.log(pc.green(`✔ Discovered ${ALL_MODELS.length} models from upstream Zen API.`));
+    }
+    return true;
+  }
+  return false;
 }
 
 function responsesToOpenAI(resp, requestedModel) {
@@ -1334,11 +1425,15 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
   req.end();
 }
 
-app.get("/v1/models", (req, res) => {
+app.get("/v1/models", async (req, res) => {
   const user = auth(req);
   if (!user) {
     const mapped = mapZenError(401, { message: "Invalid API key" }, "openai");
     return res.status(mapped.status).json(mapped.body);
+  }
+
+  if (Date.now() - lastModelsFetchTime > 5 * 60 * 1000) {
+    await refreshModels(true).catch(() => {});
   }
 
   res.setHeader("x-zen-served-by", "ocodeproxy");
@@ -1350,6 +1445,27 @@ app.get("/v1/models", (req, res) => {
       created: 1779000000,
       owned_by: "opencode-free",
     })),
+  });
+});
+
+app.get("/v1/models/:id", (req, res) => {
+  const user = auth(req);
+  if (!user) {
+    const mapped = mapZenError(401, { message: "Invalid API key" }, "openai");
+    return res.status(mapped.status).json(mapped.body);
+  }
+
+  const id = req.params.id;
+  if (!id) {
+    return res.status(404).json({ error: { message: "Model not found", type: "not_found_error" } });
+  }
+
+  res.setHeader("x-zen-served-by", "ocodeproxy");
+  res.json({
+    id,
+    object: "model",
+    created: 1779000000,
+    owned_by: "opencode-free",
   });
 });
 
@@ -1368,7 +1484,11 @@ app.post("/v1/chat/completions", async (req, res) => {
     });
   }
 
-  if (!ALL_MODELS.includes(model) && !MODEL_ALIASES[model]) {
+  if (!isKnownModel(model)) {
+    await refreshModels(true).catch(() => {});
+  }
+
+  if (!isKnownModel(model)) {
     return res.status(400).json({
       error: { message: `Unknown model: ${model}. Available: ${ALL_MODELS.join(", ")}`, type: "invalid_request_error" },
     });
@@ -1440,7 +1560,11 @@ app.post("/v1/messages", async (req, res) => {
     });
   }
 
-  if (!ALL_MODELS.includes(model) && !MODEL_ALIASES[model]) {
+  if (!isKnownModel(model)) {
+    await refreshModels(true).catch(() => {});
+  }
+
+  if (!isKnownModel(model)) {
     return res.status(400).json({
       type: "error",
       error: { type: "invalid_request_error", message: `Unknown model: ${model}. Available: ${ALL_MODELS.join(", ")}` },
@@ -1655,6 +1779,8 @@ async function openSettings() {
       message: "Settings menu:",
       options: [
         { value: "port", label: "Change / Hot-swap port", hint: `current: ${currentPort}` },
+        { value: "refresh_models", label: "Refresh models from upstream", hint: `${ALL_MODELS.length} discovered` },
+        { value: "list_models", label: "View available models", hint: `${ALL_MODELS.length} models` },
         { value: "new_key", label: "Generate new API key", hint: "create key with custom name" },
         { value: "regenerate_keys", label: "Regenerate default keys", hint: "reset admin & user-default" },
         { value: "list_keys", label: "View active API keys", hint: `source: ${KEYS_FILE}` },
@@ -1671,6 +1797,21 @@ async function openSettings() {
       await hotSwap();
       inSettings = false;
       break;
+    } else if (action === "refresh_models") {
+      const s = p.spinner();
+      s.start("Discovering models from upstream Zen API...");
+      const ok = await refreshModels(true);
+      if (ok) {
+        s.stop(pc.green(`✔ Discovered ${ALL_MODELS.length} models from upstream!`));
+      } else {
+        s.stop(pc.yellow(`⚠ Upstream discovery failed, keeping ${ALL_MODELS.length} current models.`));
+      }
+    } else if (action === "list_models") {
+      p.log.info(pc.cyan(`Discovered Models (${ALL_MODELS.length}):`));
+      for (const m of ALL_MODELS) {
+        const type = isResponsesModel(m) ? pc.magenta("responses") : pc.green("chat");
+        p.log.message(`  ${pc.bold(m.padEnd(35))} ${pc.dim(`[${type}]`)}`);
+      }
     } else if (action === "new_key") {
       const keyName = await p.text({
         message: "Enter name for new API key:",
@@ -1735,3 +1876,5 @@ async function onKeypress(str, key) {
 
 currentServer = startServer(currentPort);
 setupKeybindings();
+
+refreshModels(true).catch(() => {});
