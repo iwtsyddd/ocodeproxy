@@ -114,7 +114,7 @@ app.use((req, res, next) => {
 let apiKeys = {};
 
 function generateKeyString() {
-  return "oc-" + crypto.randomBytes(20).toString("hex");
+  return "ocp-" + crypto.randomBytes(20).toString("hex");
 }
 
 function saveKeys() {
