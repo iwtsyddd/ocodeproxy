@@ -18,7 +18,7 @@ if (process.stdout.isTTY) {
 
 const TUI_VERSION = "v0.1.0-t1";
 const PROXY_VERSION = process.env.PROXY_VERSION || "16";
-const OC_VERSION = process.env.OC_VERSION || "1.18.30";
+const OC_VERSION = process.env.OC_VERSION || "1.18.31";
 const AI_SDK_VER = process.env.AI_SDK_VER || "4.0.23";
 const BUN_VER = process.env.BUN_VER || "1.3.13";
 const OPENCODE_CLIENT = process.env.OPENCODE_CLIENT || "cli";
@@ -143,10 +143,31 @@ function auth(req) {
   return null;
 }
 
+const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+let lastIdTimestamp = 0;
+let idCounter = 0;
+
+function randomBase62(length) {
+  const bytes = crypto.randomBytes(length);
+  let result = "";
+  for (let i = 0; i < length; i++) result += BASE62[bytes[i] % 62];
+  return result;
+}
+
 function ocId(prefix) {
-  const ts = Date.now().toString(16);
-  const rnd = crypto.randomBytes(12).toString("base64url").slice(0, 16);
-  return `${prefix}_${ts}${rnd}`;
+  const currentTimestamp = Date.now();
+  if (currentTimestamp !== lastIdTimestamp) {
+    lastIdTimestamp = currentTimestamp;
+    idCounter = 0;
+  }
+  idCounter++;
+
+  const now = BigInt(currentTimestamp) * BigInt(0x1000) + BigInt(idCounter);
+  const timeBytes = Buffer.alloc(6);
+  for (let i = 0; i < 6; i++) {
+    timeBytes[i] = Number((now >> BigInt(40 - 8 * i)) & BigInt(0xff));
+  }
+  return `${prefix}_${timeBytes.toString("hex")}${randomBase62(14)}`;
 }
 
 const userSessions = {};
@@ -306,7 +327,9 @@ function zenRequest(model, messages, _stream, tools, tool_choice, sessionId) {
 }
 
 function zenResponsesRequest(targetModel, messages, _stream, tools, tool_choice, sessionId) {
-  const reqPayload = chatToResponses(targetModel, messages, tools, tool_choice);
+  const mergedTools = ensureFingerprintTools(tools);
+  const effectiveToolChoice = tool_choice || "auto";
+  const reqPayload = chatToResponses(targetModel, messages, mergedTools, effectiveToolChoice);
   reqPayload.stream = true;
   const body = JSON.stringify(reqPayload);
   const requestId = ocId("msg");
