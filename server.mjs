@@ -7,6 +7,8 @@ import net from "node:net";
 import crypto from "node:crypto";
 import https from "node:https";
 import fs from "node:fs";
+import { SocksProxyAgent } from "socks-proxy-agent";
+import { HttpsProxyAgent } from "https-proxy-agent";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -26,6 +28,54 @@ const OPENCODE_PROJECT = process.env.OPENCODE_PROJECT || "global";
 const ZEN_AUTH_MODE = process.env.ZEN_AUTH_MODE || "public";
 const KEYS_FILE = process.env.KEYS_FILE || "./api-keys.json";
 const MODELS_FILE = process.env.MODELS_FILE || "./models.json";
+const PROXY_CONFIG_FILE = process.env.PROXY_CONFIG_FILE || "./proxy-config.json";
+
+let upstreamProxyUrl = process.env.UPSTREAM_PROXY || process.env.ALL_PROXY || process.env.HTTPS_PROXY || "";
+let upstreamProxyAgent = null;
+
+function setupProxyAgent(proxyUrl) {
+  if (!proxyUrl || !proxyUrl.trim()) {
+    upstreamProxyUrl = "";
+    upstreamProxyAgent = null;
+    return;
+  }
+  const url = proxyUrl.trim();
+  try {
+    if (url.startsWith("socks5://") || url.startsWith("socks4://") || url.startsWith("socks://")) {
+      upstreamProxyAgent = new SocksProxyAgent(url);
+      upstreamProxyUrl = url;
+    } else if (url.startsWith("http://") || url.startsWith("https://")) {
+      upstreamProxyAgent = new HttpsProxyAgent(url);
+      upstreamProxyUrl = url;
+    } else {
+      upstreamProxyAgent = new HttpsProxyAgent(`http://${url}`);
+      upstreamProxyUrl = `http://${url}`;
+    }
+  } catch (err) {
+    upstreamProxyAgent = null;
+    upstreamProxyUrl = "";
+  }
+}
+
+function saveProxyConfig() {
+  try {
+    fs.writeFileSync(PROXY_CONFIG_FILE, JSON.stringify({ upstreamProxy: upstreamProxyUrl }, null, 2), "utf8");
+  } catch {}
+}
+
+function loadProxyConfig() {
+  try {
+    if (fs.existsSync(PROXY_CONFIG_FILE)) {
+      const data = JSON.parse(fs.readFileSync(PROXY_CONFIG_FILE, "utf8"));
+      if (typeof data.upstreamProxy === "string") {
+        setupProxyAgent(data.upstreamProxy);
+      }
+    } else if (upstreamProxyUrl) {
+      setupProxyAgent(upstreamProxyUrl);
+    }
+  } catch {}
+}
+loadProxyConfig();
 
 function isPortAvailable(port) {
   return new Promise((resolve) => {
@@ -314,16 +364,21 @@ function zenRequest(model, messages, _stream, tools, tool_choice, sessionId) {
   const requestId = ocId("msg");
   const headers = buildZenHeaders(sessionId, requestId, true, Buffer.byteLength(body));
 
+  const options = {
+    hostname: "opencode.ai",
+    port: 443,
+    path: "/zen/v1/chat/completions",
+    method: "POST",
+    headers,
+    timeout: 120000,
+  };
+  if (upstreamProxyAgent) {
+    options.agent = upstreamProxyAgent;
+  }
+
   return {
     body,
-    options: {
-      hostname: "opencode.ai",
-      port: 443,
-      path: "/zen/v1/chat/completions",
-      method: "POST",
-      headers,
-      timeout: 120000,
-    },
+    options,
   };
 }
 
@@ -336,16 +391,21 @@ function zenResponsesRequest(targetModel, messages, _stream, tools, tool_choice,
   const requestId = ocId("msg");
   const headers = buildZenHeaders(sessionId, requestId, true, Buffer.byteLength(body));
 
+  const options = {
+    hostname: "opencode.ai",
+    port: 443,
+    path: "/zen/v1/responses",
+    method: "POST",
+    headers,
+    timeout: 120000,
+  };
+  if (upstreamProxyAgent) {
+    options.agent = upstreamProxyAgent;
+  }
+
   return {
     body,
-    options: {
-      hostname: "opencode.ai",
-      port: 443,
-      path: "/zen/v1/responses",
-      method: "POST",
-      headers,
-      timeout: 120000,
-    },
+    options,
   };
 }
 
@@ -437,14 +497,19 @@ function fetchUpstreamModels() {
       "Accept": "application/json",
     };
 
-    const req = https.request({
+    const options = {
       hostname: "opencode.ai",
       port: 443,
       path: "/zen/v1/models",
       method: "GET",
       headers,
       timeout: 15000,
-    }, (res) => {
+    };
+    if (upstreamProxyAgent) {
+      options.agent = upstreamProxyAgent;
+    }
+
+    const req = https.request(options, (res) => {
       let data = "";
       res.on("data", (chunk) => { data += chunk; });
       res.on("end", () => {
@@ -1652,6 +1717,7 @@ app.get("/health", (_req, res) => {
     ocVersion: OC_VERSION,
     ua: `opencode/${OC_VERSION} ai-sdk/provider-utils/${AI_SDK_VER} runtime/bun/${BUN_VER}`,
     zenAuthMode: ZEN_AUTH_MODE,
+    upstreamProxy: upstreamProxyUrl || null,
     endpoints: [
       "/health",
       "/v1/models",
@@ -1689,6 +1755,7 @@ function renderBanner(port) {
     `${pc.bold("Models:")}    ${pc.cyan(String(ALL_MODELS.length))} ${pc.dim("upstream models")}`,
     `${pc.bold("Local:")}     ${pc.cyan(localUrl)}`,
     `${pc.bold("Network:")}   ${pc.dim(networkUrl)}`,
+    ...(upstreamProxyUrl ? [`${pc.bold("Proxy:")}     ${pc.yellow(upstreamProxyUrl)}`] : []),
     "",
     `${pc.bold("Endpoints:")}`,
     `  ${pc.green("GET")}   /health               ${pc.dim("→ Health & status check")}`,
@@ -1798,6 +1865,7 @@ async function openSettings() {
       message: "Settings menu:",
       options: [
         { value: "port", label: "Change / Hot-swap port", hint: `current: ${currentPort}` },
+        { value: "proxy", label: "Configure Outbound Proxy (SOCKS5 / HTTP)", hint: upstreamProxyUrl ? upstreamProxyUrl : "direct connection" },
         { value: "refresh_models", label: "Refresh models from upstream", hint: `${ALL_MODELS.length} discovered` },
         { value: "list_models", label: "View available models", hint: `${ALL_MODELS.length} models` },
         { value: "new_key", label: "Generate new API key", hint: "create key with custom name" },
@@ -1816,6 +1884,39 @@ async function openSettings() {
       await hotSwap();
       inSettings = false;
       break;
+    } else if (action === "proxy") {
+      p.log.info(pc.cyan(`Current outbound proxy: ${upstreamProxyUrl ? pc.bold(upstreamProxyUrl) : pc.dim("none (direct connection)")}`));
+      const proxyChoice = await p.select({
+        message: "Proxy configuration:",
+        options: [
+          { value: "set", label: "Set / Update proxy URL", hint: "e.g. socks5://127.0.0.1:1080 or http://127.0.0.1:8080" },
+          { value: "clear", label: "Disable proxy (use direct connection)" },
+          { value: "cancel", label: "Back to settings menu" },
+        ],
+      });
+
+      if (!p.isCancel(proxyChoice)) {
+        if (proxyChoice === "set") {
+          const inputUrl = await p.text({
+            message: "Enter Proxy URL (supports socks5://, socks4://, http://, https://):",
+            placeholder: "socks5://127.0.0.1:1080",
+            initialValue: upstreamProxyUrl,
+            validate(val) {
+              if (!val || !val.trim()) return "Proxy URL cannot be empty";
+            },
+          });
+
+          if (!p.isCancel(inputUrl) && inputUrl.trim()) {
+            setupProxyAgent(inputUrl.trim());
+            saveProxyConfig();
+            p.log.success(pc.green(`✔ Outbound proxy configured: ${pc.bold(upstreamProxyUrl)}`));
+          }
+        } else if (proxyChoice === "clear") {
+          setupProxyAgent("");
+          saveProxyConfig();
+          p.log.success(pc.green("✔ Outbound proxy disabled. Using direct connection."));
+        }
+      }
     } else if (action === "refresh_models") {
       const s = p.spinner();
       s.start("Discovering models from upstream Zen API...");
