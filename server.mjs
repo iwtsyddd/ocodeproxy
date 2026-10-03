@@ -25,6 +25,7 @@ const OPENCODE_CLIENT = process.env.OPENCODE_CLIENT || "cli";
 const OPENCODE_PROJECT = process.env.OPENCODE_PROJECT || "global";
 const ZEN_AUTH_MODE = process.env.ZEN_AUTH_MODE || "public";
 const KEYS_FILE = process.env.KEYS_FILE || "./api-keys.json";
+const MODELS_FILE = process.env.MODELS_FILE || "./models.json";
 
 function isPortAvailable(port) {
   return new Promise((resolve) => {
@@ -349,7 +350,6 @@ function zenResponsesRequest(targetModel, messages, _stream, tools, tool_choice,
 }
 
 const DEFAULT_CHAT_MODELS = [
-  "deepseek-v4-flash-free",
   "big-pickle",
   "space-bunny-free",
   "mimo-v2.6-flash-free",
@@ -364,18 +364,18 @@ const DEFAULT_CHAT_MODELS = [
 
 const DEFAULT_RESPONSES_MODELS = [
   "muse-spark-1.3-contributor-free",
-  "muse-spark-1.3",
   "muse-spark-1.2-contributor-free",
 ];
 
 const MODEL_ALIASES = {
-  "deepseek-v4-flash": "deepseek-v4-flash-free",
   "muse-spark-1.3-free": "muse-spark-1.3-contributor-free",
   "mimo-v2.6-flash": "mimo-v2.6-flash-free",
 };
 
 const DISCONTINUED_MODELS = new Set([
   "jev-1.13-free",
+  "deepseek-v4-flash-free",
+  "deepseek-v4-flash",
 ]);
 
 let CHAT_MODELS = [...DEFAULT_CHAT_MODELS];
@@ -383,6 +383,31 @@ let RESPONSES_MODELS = [...DEFAULT_RESPONSES_MODELS];
 let ALL_MODELS = [...CHAT_MODELS, ...RESPONSES_MODELS];
 let RESPONSES_SET = new Set(RESPONSES_MODELS);
 let lastModelsFetchTime = 0;
+
+function saveModels() {
+  try {
+    fs.writeFileSync(MODELS_FILE, JSON.stringify(ALL_MODELS, null, 2), "utf8");
+  } catch {}
+}
+
+function loadModels() {
+  try {
+    const raw = fs.readFileSync(MODELS_FILE, "utf8");
+    const list = JSON.parse(raw);
+    if (Array.isArray(list) && list.length > 0) {
+      const filtered = list.filter((id) => !DISCONTINUED_MODELS.has(id));
+      const resp = filtered.filter((id) => id.startsWith("muse-spark"));
+      const chat = filtered.filter((id) => !id.startsWith("muse-spark"));
+      if (chat.length || resp.length) {
+        CHAT_MODELS = chat;
+        RESPONSES_MODELS = resp;
+        ALL_MODELS = [...CHAT_MODELS, ...RESPONSES_MODELS];
+        RESPONSES_SET = new Set(RESPONSES_MODELS);
+      }
+    }
+  } catch {}
+}
+loadModels();
 
 function isDeprecatedModel(model) {
   return DISCONTINUED_MODELS.has(model);
@@ -433,7 +458,7 @@ function fetchUpstreamModels() {
 
           const discoveredIds = list.map((m) => m.id).filter(Boolean);
           const freeIds = discoveredIds.filter(
-            (id) => (id.includes("free") || id === "big-pickle" || id.startsWith("muse-spark")) && !DISCONTINUED_MODELS.has(id)
+            (id) => (id.includes("free") || id === "big-pickle") && !DISCONTINUED_MODELS.has(id)
           );
 
           if (!freeIds.length) return resolve(null);
@@ -446,13 +471,6 @@ function fetchUpstreamModels() {
             } else {
               newChat.push(id);
             }
-          }
-
-          for (const m of DEFAULT_RESPONSES_MODELS) {
-            if (!newResponses.includes(m) && !DISCONTINUED_MODELS.has(m)) newResponses.push(m);
-          }
-          for (const m of DEFAULT_CHAT_MODELS) {
-            if (!newChat.includes(m) && !DISCONTINUED_MODELS.has(m)) newChat.push(m);
           }
 
           resolve({ chat: newChat, responses: newResponses });
@@ -476,6 +494,7 @@ async function refreshModels(silent = false) {
     ALL_MODELS = [...CHAT_MODELS, ...RESPONSES_MODELS];
     RESPONSES_SET = new Set(RESPONSES_MODELS);
     lastModelsFetchTime = Date.now();
+    saveModels();
     if (!silent) {
       console.log(pc.green(`✔ Discovered ${ALL_MODELS.length} models from upstream Zen API.`));
     }

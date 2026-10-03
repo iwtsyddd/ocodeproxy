@@ -3,5 +3,6 @@ template/
 *.log
 .env
 api-keys.json
+models.json
 .DS_Store
 Thumbs.db
