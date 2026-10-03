@@ -20,7 +20,11 @@ if (process.stdout.isTTY) {
 
 const TUI_VERSION = "v0.1.0-t1";
 const PROXY_VERSION = process.env.PROXY_VERSION || "16";
-const OC_VERSION = process.env.OC_VERSION || "1.18.31";
+const FALLBACK_OC_VERSION = "1.18.31";
+let ocVersion = process.env.OC_VERSION || FALLBACK_OC_VERSION;
+let lastOcVersionCheck = 0;
+const OC_VERSION_CHECK_INTERVAL = 6 * 60 * 60 * 1000;
+
 const AI_SDK_VER = process.env.AI_SDK_VER || "4.0.23";
 const BUN_VER = process.env.BUN_VER || "1.3.13";
 const OPENCODE_CLIENT = process.env.OPENCODE_CLIENT || "cli";
@@ -76,6 +80,66 @@ function loadProxyConfig() {
   } catch {}
 }
 loadProxyConfig();
+
+function fetchLatestOcVersion() {
+  return new Promise((resolve) => {
+    const options = {
+      hostname: "registry.npmjs.org",
+      port: 443,
+      path: "/opencode-ai/latest",
+      method: "GET",
+      headers: {
+        "User-Agent": "node",
+        "Accept": "application/json",
+      },
+      timeout: 10000,
+    };
+    if (upstreamProxyAgent) {
+      options.agent = upstreamProxyAgent;
+    }
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          if (res.statusCode !== 200) return resolve(null);
+          const pkg = JSON.parse(data);
+          if (typeof pkg.version === "string" && /^\d+\.\d+\.\d+/.test(pkg.version)) {
+            return resolve(pkg.version);
+          }
+          resolve(null);
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+async function updateOcVersion(silent = false) {
+  const latest = await fetchLatestOcVersion();
+  lastOcVersionCheck = Date.now();
+  if (latest && latest !== ocVersion) {
+    const prev = ocVersion;
+    ocVersion = latest;
+    if (!silent) {
+      console.log(pc.green(`✔ Updated OpenCode User-Agent version: ${prev} → ${pc.bold(latest)}`));
+    }
+    return { updated: true, version: latest, prev };
+  }
+  return { updated: false, version: ocVersion, latest: latest || ocVersion };
+}
+
+function checkPeriodicOcVersion() {
+  if (Date.now() - lastOcVersionCheck > OC_VERSION_CHECK_INTERVAL) {
+    updateOcVersion(true).catch(() => {});
+  }
+}
 
 function isPortAvailable(port) {
   return new Promise((resolve) => {
@@ -231,11 +295,12 @@ function getSession(user) {
 }
 
 function buildZenHeaders(sessionId, requestId, isStream = false, bodyLength = 0) {
+  checkPeriodicOcVersion();
   const reqId = requestId || ocId("msg");
   const headers = {
     "Content-Type": "application/json",
     "Authorization": `Bearer ${ZEN_AUTH_MODE}`,
-    "User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/${AI_SDK_VER} runtime/bun/${BUN_VER}`,
+    "User-Agent": `opencode/${ocVersion} ai-sdk/provider-utils/${AI_SDK_VER} runtime/bun/${BUN_VER}`,
     "x-opencode-client": OPENCODE_CLIENT,
     "x-opencode-project": OPENCODE_PROJECT,
     "x-opencode-request": reqId,
@@ -489,9 +554,10 @@ function isKnownModel(model) {
 
 function fetchUpstreamModels() {
   return new Promise((resolve) => {
+    checkPeriodicOcVersion();
     const headers = {
       "Authorization": `Bearer ${ZEN_AUTH_MODE}`,
-      "User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/${AI_SDK_VER} runtime/bun/${BUN_VER}`,
+      "User-Agent": `opencode/${ocVersion} ai-sdk/provider-utils/${AI_SDK_VER} runtime/bun/${BUN_VER}`,
       "x-opencode-client": OPENCODE_CLIENT,
       "x-opencode-project": OPENCODE_PROJECT,
       "Accept": "application/json",
@@ -1714,8 +1780,8 @@ app.get("/health", (_req, res) => {
     proxy_version: `v${PROXY_VERSION}`,
     port: currentPort,
     models: ALL_MODELS.length,
-    ocVersion: OC_VERSION,
-    ua: `opencode/${OC_VERSION} ai-sdk/provider-utils/${AI_SDK_VER} runtime/bun/${BUN_VER}`,
+    ocVersion: ocVersion,
+    ua: `opencode/${ocVersion} ai-sdk/provider-utils/${AI_SDK_VER} runtime/bun/${BUN_VER}`,
     zenAuthMode: ZEN_AUTH_MODE,
     upstreamProxy: upstreamProxyUrl || null,
     endpoints: [
@@ -1866,6 +1932,7 @@ async function openSettings() {
       options: [
         { value: "port", label: "Change / Hot-swap port", hint: `current: ${currentPort}` },
         { value: "proxy", label: "Configure Outbound Proxy (SOCKS5 / HTTP)", hint: upstreamProxyUrl ? upstreamProxyUrl : "direct connection" },
+        { value: "update_ua", label: "Check & update OpenCode UA version", hint: `current: ${ocVersion}` },
         { value: "refresh_models", label: "Refresh models from upstream", hint: `${ALL_MODELS.length} discovered` },
         { value: "list_models", label: "View available models", hint: `${ALL_MODELS.length} models` },
         { value: "new_key", label: "Generate new API key", hint: "create key with custom name" },
@@ -1916,6 +1983,17 @@ async function openSettings() {
           saveProxyConfig();
           p.log.success(pc.green("✔ Outbound proxy disabled. Using direct connection."));
         }
+      }
+    } else if (action === "update_ua") {
+      const s = p.spinner();
+      s.start(`Checking latest OpenCode release (current: ${ocVersion})...`);
+      const res = await updateOcVersion(true);
+      if (res.updated) {
+        s.stop(pc.green(`✔ OpenCode UA version updated: ${res.prev} → ${pc.bold(res.version)}!`));
+      } else if (res.latest && res.latest === ocVersion) {
+        s.stop(pc.cyan(`ℹ OpenCode UA version is already up to date (${pc.bold(ocVersion)}).`));
+      } else {
+        s.stop(pc.yellow(`⚠ Could not fetch latest release. Kept current version (${ocVersion}).`));
       }
     } else if (action === "refresh_models") {
       const s = p.spinner();
@@ -2000,4 +2078,6 @@ async function onKeypress(str, key) {
 currentServer = startServer(currentPort);
 setupKeybindings();
 
+updateOcVersion(true).catch(() => {});
 refreshModels(true).catch(() => {});
+setInterval(checkPeriodicOcVersion, 60 * 60 * 1000);
