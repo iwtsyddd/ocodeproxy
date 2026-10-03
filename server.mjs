@@ -1873,7 +1873,10 @@ async function openSettings() {
     }
   }
 
-  p.outro(pc.dim("Proxy listening resumed."));
+  if (process.stdout.isTTY) {
+    console.clear();
+    renderBanner(currentPort);
+  }
   setupKeybindings();
 }
 
