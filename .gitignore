@@ -1,0 +1,7 @@
+node_modules/
+template/
+*.log
+.env
+api-keys.json
+.DS_Store
+Thumbs.db
