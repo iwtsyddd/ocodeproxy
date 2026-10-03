@@ -1680,7 +1680,7 @@ function renderBanner(port) {
       ? [
           "",
           `${pc.bold("Controls:")}`,
-          `  ${pc.yellow("[s]")} ⚙️  Settings (hot-swap port, manage API keys)`,
+          `  ${pc.yellow("[s]")} ⚙️  Settings`,
           `  ${pc.gray("[q]")} 🚪 Stop server`,
         ]
       : []),
