@@ -1,6 +1,6 @@
 {
   "name": "ocodeproxy",
-  "version": "0.1.0",
+  "version": "0.1.0-t1",
   "description": "OCodeProxy",
   "type": "module",
   "main": "server.mjs",
