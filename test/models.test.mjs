@@ -68,6 +68,20 @@ describe("partitionDiscovered", () => {
     assert.deepEqual(partitionDiscovered([]), { chat: [], responses: [] });
     assert.deepEqual(partitionDiscovered(null), { chat: [], responses: [] });
   });
+  it("keeps suffixless free models via catalog metadata", () => {
+    const meta = new Map([["grok-code", { id: "grok-code", free: true }]]);
+    const out = partitionDiscovered(["grok-code", "paid-pro"], DISCONTINUED_MODELS, meta);
+    assert.deepEqual(out, { chat: ["grok-code"], responses: [] });
+  });
+  it("metadata never revives discontinued ids", () => {
+    const meta = new Map([["jev-1.13-free", { id: "jev-1.13-free", free: true }]]);
+    const out = partitionDiscovered(["jev-1.13-free"], DISCONTINUED_MODELS, meta);
+    assert.deepEqual(out, { chat: [], responses: [] });
+  });
+  it("metadata never drops name-matched ids", () => {
+    const out = partitionDiscovered(["plain-free"], DISCONTINUED_MODELS, new Map());
+    assert.deepEqual(out, { chat: ["plain-free"], responses: [] });
+  });
 });
 
 describe("shouldKeepCurrent", () => {

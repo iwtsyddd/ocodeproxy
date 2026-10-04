@@ -47,6 +47,15 @@ import {
   getFallbackModels,
 } from "./lib/models.mjs";
 import {
+  MODELS_DEV_DEFAULT_URL,
+  MODELS_DEV_DEFAULT_TTL_MS,
+  MODELS_DEV_DEFAULT_FILE,
+  parseModelsDevCatalog,
+  serializeMetaMap,
+  deserializeMetaMap,
+  metaForId,
+} from "./lib/catalog.mjs";
+import {
   responsesErrorStatus,
   mapZenError,
   publicNetworkMessage,
@@ -78,6 +87,9 @@ const OPENCODE_PROJECT = process.env.OPENCODE_PROJECT || "global";
 const ZEN_AUTH_MODE = process.env.ZEN_AUTH_MODE || "public";
 const KEYS_FILE = process.env.KEYS_FILE || "./api-keys.json";
 const MODELS_FILE = process.env.MODELS_FILE || "./models.json";
+const MODELS_DEV_URL = process.env.MODELS_DEV_URL || MODELS_DEV_DEFAULT_URL;
+const MODELS_DEV_FILE = process.env.MODELS_DEV_FILE || MODELS_DEV_DEFAULT_FILE;
+const MODELS_DEV_TTL_MS = parsePositiveIntEnv("MODELS_DEV_TTL_MS", MODELS_DEV_DEFAULT_TTL_MS, 60 * 1000, 30 * 24 * 60 * 60 * 1000);
 const PROXY_CONFIG_FILE = process.env.PROXY_CONFIG_FILE || "./proxy-config.json";
 
 let upstreamProxyUrl = process.env.UPSTREAM_PROXY || process.env.ALL_PROXY || process.env.HTTPS_PROXY || "";
@@ -581,6 +593,29 @@ let RESPONSES_MODELS = [...DEFAULT_RESPONSES_MODELS];
 let ALL_MODELS = [...CHAT_MODELS, ...RESPONSES_MODELS];
 let RESPONSES_SET = new Set(RESPONSES_MODELS);
 let lastModelsFetchTime = 0;
+// Enrichment sidecar: Map<id, meta> from models.dev. Empty when the fetch
+// failed, timed out, or is disabled. Never affects which ids are served.
+let META_MAP = new Map();
+let lastMetaFetchTime = 0;
+let metaSource = "none";
+
+function loadMetaCache() {
+  try {
+    const raw = fs.readFileSync(MODELS_DEV_FILE, "utf8");
+    const restored = deserializeMetaMap(JSON.parse(raw));
+    if (restored.size > 0) {
+      META_MAP = restored;
+      metaSource = "cache";
+    }
+  } catch {}
+}
+
+function saveMetaCache() {
+  try {
+    fs.writeFileSync(MODELS_DEV_FILE, JSON.stringify(serializeMetaMap(META_MAP), null, 2), "utf8");
+  } catch {}
+}
+loadMetaCache();
 
 function saveModels() {
   try {
@@ -621,6 +656,30 @@ function isKnownModel(model) {
 
 function defaultFallbackModel() {
   return CHAT_MODELS[0] || ALL_MODELS[0] || DEFAULT_CHAT_MODELS[0];
+}
+
+// Served model object for /v1/models and /v1/models/:id. OpenAI-style id
+// plus real catalog fields when models.dev metadata is available
+// (context_window, max_output_tokens, description). Unknown ids get the
+// bare shape; Claude discovery aliases inherit the fallback's numbers.
+function servedModelObject(id) {
+  const meta = metaForId(id, META_MAP, defaultFallbackModel());
+  const obj = {
+    id,
+    object: "model",
+    type: "model",
+    created: 1779000000,
+    created_at: "2026-07-24T00:00:00Z",
+    owned_by: "opencode-free",
+    display_name: (meta && meta.name) || id,
+    description: (meta && meta.description)
+      || (isClaudeGatewayId(id) && !ALL_MODELS.includes(id)
+        ? `OCodeProxy alias for ${defaultFallbackModel()}`
+        : "OCodeProxy Zen gateway model"),
+  };
+  if (meta && meta.contextWindow) obj.context_window = meta.contextWindow;
+  if (meta && meta.maxOutputTokens) obj.max_output_tokens = meta.maxOutputTokens;
+  return obj;
 }
 
 // Claude Code sends Anthropic model ids (claude-*, provider-prefixed ids,
@@ -683,7 +742,7 @@ function fetchUpstreamModels() {
           if (!list.length) return resolve(null);
 
           const discoveredIds = list.map((m) => m.id).filter(Boolean);
-          const { chat: newChat, responses: newResponses } = partitionDiscovered(discoveredIds);
+          const { chat: newChat, responses: newResponses } = partitionDiscovered(discoveredIds, DISCONTINUED_MODELS, META_MAP);
 
           if (!newChat.length && !newResponses.length) return resolve(null);
 
@@ -700,7 +759,64 @@ function fetchUpstreamModels() {
   });
 }
 
+// Fetch the models.dev catalog and extract opencode free-model metadata.
+// Runs on its own TTL (default 24h), never blocks model discovery, and
+// never affects which ids are served — enrichment only.
+function fetchModelsDevMeta() {
+  return new Promise((resolve) => {
+    if (!MODELS_DEV_URL || !MODELS_DEV_URL.trim()) return resolve(null);
+    let url;
+    try {
+      url = new URL(MODELS_DEV_URL.trim());
+    } catch {
+      return resolve(null);
+    }
+    if (url.protocol !== "https:" && url.protocol !== "http:") return resolve(null);
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === "https:" ? 443 : 80),
+      path: `${url.pathname}${url.search}`,
+      method: "GET",
+      headers: { "Accept": "application/json", "User-Agent": "OCodeProxy" },
+      timeout: 30000,
+    };
+    applyUpstreamProxy(options);
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          if (res.statusCode !== 200) return resolve(null);
+          const parsed = JSON.parse(data);
+          const map = parseModelsDevCatalog(parsed);
+          resolve(map.size > 0 ? map : null);
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+async function maybeRefreshMeta() {
+  if (!MODELS_DEV_URL || !MODELS_DEV_URL.trim()) return false;
+  if (META_MAP.size > 0 && Date.now() - lastMetaFetchTime <= MODELS_DEV_TTL_MS) return true;
+  const map = await fetchModelsDevMeta().catch(() => null);
+  lastMetaFetchTime = Date.now();
+  if (map && map.size > 0) {
+    META_MAP = map;
+    metaSource = "live";
+    saveMetaCache();
+    return true;
+  }
+  return false;
+}
+
 async function refreshModels(silent = false, opts = {}) {
+  await maybeRefreshMeta().catch(() => false);
   const result = await fetchUpstreamModels();
   if (result) {
     const guard = shouldKeepCurrent(
@@ -1976,18 +2092,7 @@ app.get("/v1/models", async (req, res) => {
   const ids = buildDiscoveryList(ALL_MODELS).slice(0, limit);
   res.json({
     object: "list",
-    data: ids.map((id) => ({
-      id,
-      object: "model",
-      type: "model",
-      created: 1779000000,
-      created_at: "2026-07-24T00:00:00Z",
-      owned_by: "opencode-free",
-      display_name: id,
-      description: isClaudeGatewayId(id) && !ALL_MODELS.includes(id)
-        ? `OCodeProxy alias for ${defaultFallbackModel()}`
-        : "OCodeProxy Zen gateway model",
-    })),
+    data: ids.map((id) => servedModelObject(id)),
   });
 });
 
@@ -2023,12 +2128,7 @@ app.get("/v1/models/:id", async (req, res) => {
   }
 
   res.setHeader("x-zen-served-by", "ocodeproxy");
-  res.json({
-    id,
-    object: "model",
-    created: 1779000000,
-    owned_by: "opencode-free",
-  });
+  res.json(servedModelObject(id));
 });
 
 app.post("/v1/chat/completions", async (req, res) => {
@@ -2338,6 +2438,7 @@ app.get("/health", (_req, res) => {
     proxy_version: `v${PROXY_VERSION}`,
     port: currentPort,
     models: ALL_MODELS.length,
+    modelsMeta: { entries: META_MAP.size, source: metaSource },
     ocVersion: ocVersion,
     zenAuthMode: ZEN_AUTH_MODE,
     upstreamProxyConfigured: Boolean(upstreamProxyUrl),
@@ -2601,6 +2702,7 @@ async function openSettingsMenu() {
         { value: "update_ua", label: "Check & update OpenCode UA version", hint: `current: ${ocVersion}` },
         { value: "refresh_models", label: "Refresh models from upstream", hint: `${ALL_MODELS.length} discovered` },
         { value: "list_models", label: "View available models", hint: `${ALL_MODELS.length} models` },
+        { value: "refresh_meta", label: "Refresh model metadata (models.dev)", hint: metaSource === "live" ? `${META_MAP.size} entries` : "not loaded" },
         { value: "new_key", label: "Generate new API key", hint: "create key with custom name" },
         { value: "regenerate_keys", label: "Regenerate default keys", hint: "reset admin & user-default" },
         { value: "list_keys", label: "View active API keys", hint: `source: ${KEYS_FILE}` },
@@ -2676,7 +2778,19 @@ async function openSettingsMenu() {
       p.log.info(pc.cyan(`Discovered Models (${ALL_MODELS.length}):`));
       for (const m of ALL_MODELS) {
         const type = isResponsesModel(m) ? pc.magenta("responses") : pc.green("chat");
-        p.log.message(`  ${pc.bold(m.padEnd(35))} ${pc.dim(`[${type}]`)}`);
+        const meta = META_MAP.get(m);
+        const window = meta && meta.contextWindow ? pc.dim(` ${meta.contextWindow}`) : "";
+        p.log.message(`  ${pc.bold(m.padEnd(35))} ${pc.dim(`[${type}]`)}${window}`);
+      }
+    } else if (action === "refresh_meta") {
+      const s = p.spinner();
+      s.start("Fetching model metadata from models.dev...");
+      lastMetaFetchTime = 0;
+      const ok = await maybeRefreshMeta().catch(() => false);
+      if (ok) {
+        s.stop(pc.green(`✔ Loaded metadata for ${META_MAP.size} models (source: ${metaSource}).`));
+      } else {
+        s.stop(pc.yellow(`⚠ Metadata fetch failed, keeping ${META_MAP.size} cached entries (source: ${metaSource}).`));
       }
     } else if (action === "new_key") {
       const keyName = await p.text({
@@ -2772,5 +2886,6 @@ setupKeybindings();
 
 updateOcVersion(true).catch(() => {});
 refreshModels(true).catch(() => {});
+maybeRefreshMeta().catch(() => {});
 const ocVersionTimer = setInterval(checkPeriodicOcVersion, 60 * 60 * 1000);
 if (typeof ocVersionTimer.unref === "function") ocVersionTimer.unref();

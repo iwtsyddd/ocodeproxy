@@ -94,6 +94,9 @@ node server.mjs --port 8080
 | `PROXY_PORT` | `6446` | Listening port |
 | `KEYS_FILE` | `./api-keys.json` | Local API keys (auto-created, `0600`) |
 | `MODELS_FILE` | `./models.json` | Cached model list |
+| `MODELS_DEV_URL` | `https://models.dev/api.json` | Catalog metadata source (empty disables) |
+| `MODELS_DEV_FILE` | `./models-meta.json` | Cached catalog metadata |
+| `MODELS_DEV_TTL_MS` | `86400000` | Metadata refresh interval (1 min – 30 days) |
 | `PROXY_CONFIG_FILE` | `./proxy-config.json` | Persisted upstream proxy URL |
 | `UPSTREAM_PROXY` / `ALL_PROXY` / `HTTPS_PROXY` | `""` | Egress proxy, e.g. `socks5://127.0.0.1:1080` (uppercase names only) |
 | `ZEN_AUTH_MODE` | `public` | Upstream Zen auth mode, sent as `Authorization: Bearer ...` |
@@ -237,9 +240,9 @@ Honest list of things that are stubbed, partial, or intentional hacks:
 - **Gateway retry headers on buffered errors.** `retry-after` / `x-should-retry` / `anthropic-ratelimit-unified-*` forwarding applies to all buffered (non-streaming) error paths; post-headers streaming errors still can't carry them.
 - **Claude Code model mapping.** Unknown `*claude*` / `*anthropic*` model ids (Claude defaults, provider-prefixed ids, gateway aliases) resolve to the default model instead of 404. `/v1/models` advertises canonical `claude-*` aliases plus real ids; `?limit=` is honored. `max_tokens` is required per spec (`0` returns an empty pre-warm message). `output_config.effort` and `thinking: adaptive/enabled` map to `reasoning_effort`; `thinking`/`redacted_thinking` blocks are dropped before upstream (no preserved-thinking check against Zen); the `x-anthropic-billing-header` attribution block is stripped before folding `system` into upstream `instructions`. Streaming translators emit each content block exactly once with sequential indices (thinking only when reasoning arrives before any text/tools, otherwise token-counted) so Claude Code never sees a malformed event sequence.
 - **Decoy tools.** Every upstream request injects `bash` / `glob` / `grep` / `read` fingerprint tools that are stripped from outputs. Upstream behavior may change if Zen starts validating these.
-- **Model list is filtered.** Only `*free*` models plus `big-pickle` are kept, with an anti-shrink guard. Alias and deprecation lists are hardcoded.
+- **Model list is filtered.** Zen inventory is the source of truth; `DISCONTINUED_MODELS` stays authoritative for exclusions. Free detection is name-based (`*free*`, `big-pickle`) plus cost-based (`cost.input/output == 0` from the models.dev catalog), so suffixless free models are kept when Zen serves them. models.dev also provides `context_window` / `max_output_tokens` / `description` for `/v1/models`; `status: deprecated` there is informational only and never filters. Without metadata (fetch failed, disabled via `MODELS_DEV_URL=""`), the gateway degrades to name-based behavior.
 - **Upstream coupling.** All traffic goes to `opencode.ai/zen/v1/*` with a forged `opencode/...` User-Agent. Upstream changes can break the proxy at any time.
-- **Tests are unit-only.** 123 tests cover `lib/` converters, errors, models, and fallback. `server.mjs` routes have no integration tests.
+- **Tests are unit-only.** 136 tests cover `lib/` converters, errors, models, catalog, and fallback. `server.mjs` routes have no integration tests.
 - **Intentional spec deviations (Anthropic path).** `max_tokens: 0` returns an empty pre-warm message without an upstream call (extension, not Anthropic behavior). Attribution detection matches any leading `system` text containing both `cc_version=` and `cch=` — a `system` prompt that merely mentions those substrings alongside real instructions is dropped as a whole. `thinking: between_tools` maps to `reasoning_effort: none`.
 
 ## Project Structure
@@ -249,6 +252,7 @@ OCodeProxy/
 ├── server.mjs          # express app, TUI, all /v1 routes
 ├── lib/
 │   ├── convert.mjs     # chat / responses / anthropic converters
+│   ├── catalog.mjs      # models.dev metadata sidecar (windows, descriptions)
 │   ├── models.mjs       # discovery, alias, fallback list
 │   ├── errors.mjs       # upstream error mapping
 │   ├── fallback.mjs     # collect / stream fallback orchestration
@@ -271,6 +275,7 @@ npm test
 | `convert.test.mjs` | Message / tool translation |
 | `responses.test.mjs` | Responses API aggregation |
 | `models.test.mjs` | Alias, deprecation, fallback |
+| `catalog.test.mjs` | models.dev parsing, free-by-cost, alias fallback |
 | `errors.test.mjs` | Zen to OpenAI / Anthropic mapping |
 | `fallback.test.mjs` | Retry orchestration |
 | `ids-keys.test.mjs` | ID format, key validation |

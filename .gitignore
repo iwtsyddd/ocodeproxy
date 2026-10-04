@@ -4,6 +4,7 @@ template/
 .env
 api-keys.json
 models.json
+models-meta.json
 proxy-config.json
 .DS_Store
 Thumbs.db
