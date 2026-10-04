@@ -2530,6 +2530,7 @@ function renderBanner(port) {
           "",
           `${pc.bold("Controls:")}`,
           `  ${pc.yellow("[s]")} ⚙️  Settings`,
+          `  ${pc.yellow("[i]")} ℹ️  Server info`,
           `  ${pc.gray("[q]")} 🚪 Stop server`,
         ]
       : []),
@@ -2839,6 +2840,32 @@ async function openSettingsMenu() {
 
 let settingsOpen = false;
 
+function showInfoPanel() {
+  const meta = META_MAP.get(defaultFallbackModel());
+  const content = [
+    `${pc.bold(pc.cyan("ℹ️  OCodeProxy Info"))} ${pc.dim(TUI_VERSION)}`,
+    "",
+    `${pc.bold("Server:")}    ${pc.green("● ONLINE")} ${pc.dim(`port ${currentPort}`)}`,
+    `${pc.bold("Upstream:")}  ${pc.dim(`opencode.ai/zen/v1 (${ZEN_AUTH_MODE})`)}`,
+    `${pc.bold("OpenCode:")}  ${pc.dim(`opencode/${ocVersion}`)}`,
+    `${pc.bold("Models:")}    ${pc.cyan(String(ALL_MODELS.length))} ${pc.dim(`discovered (${metaSource} meta: ${META_MAP.size})`)}`,
+    ...(meta && meta.contextWindow
+      ? [`${pc.bold("Fallback:")}  ${pc.dim(`${defaultFallbackModel()} · ${meta.contextWindow} ctx${meta.maxOutputTokens ? ` / ${meta.maxOutputTokens} out` : ""}`)}`]
+      : []),
+    ...(upstreamProxyUrl ? [`${pc.bold("Proxy:")}     ${pc.yellow(upstreamProxyUrl)}`] : []),
+    `${pc.bold("Keys:")}      ${pc.dim(`${Object.keys(apiKeys).length} local (${KEYS_FILE})`)}`,
+    ...(process.stdin.isTTY ? ["", pc.dim("Press any key to return")] : []),
+  ].join("\n");
+  console.log(
+    boxen(content, {
+      padding: 1,
+      margin: 1,
+      borderStyle: "round",
+      borderColor: "blue",
+    })
+  );
+}
+
 async function onKeypress(str, key) {
   if (!key || settingsOpen) return;
 
@@ -2851,6 +2878,23 @@ async function onKeypress(str, key) {
     } catch (err) {
       console.error(pc.red(`Settings error: ${err?.message || err}`));
     } finally {
+      settingsOpen = false;
+    }
+  } else if (key.name === "i") {
+    settingsOpen = true;
+    try {
+      pauseKeybindings();
+      if (process.stdout.isTTY) console.clear();
+      showInfoPanel();
+      if (process.stdin.isTTY) {
+        await new Promise((resolve) => process.stdin.once("keypress", () => resolve()));
+      }
+    } finally {
+      if (process.stdout.isTTY) {
+        console.clear();
+        renderBanner(currentPort);
+      }
+      setupKeybindings();
       settingsOpen = false;
     }
   }

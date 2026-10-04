@@ -203,6 +203,7 @@ On boot a status card is printed (port, model count, endpoints). Keys:
 | Key | Action |
 |---|---|
 | `s` / `p` | Open Settings (port hot-swap, outbound proxy, UA version check, model refresh, keys) |
+| `i` | Server info panel (status, upstream, models, metadata, keys) |
 | `q` or `Ctrl+C` | Graceful shutdown |
 
 Prompts auto-disable when stdin is not a TTY (CI, Docker, background jobs).
