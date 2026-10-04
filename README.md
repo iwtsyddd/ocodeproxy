@@ -218,6 +218,15 @@ Request log format:
 - Errors (`lib/errors.mjs`): Zen errors mapped to OpenAI / Anthropic shapes, network details sanitized.
 - IDs / keys (`lib/ids.mjs`, `lib/keys.mjs`): `ses_*` / `msg_*` ids, `ocp-` key generation and masking.
 
+## Auto mode (Claude Code)
+
+If Claude Code shows "this session isn't eligible" for no-charge classifier requests, that is expected behind this gateway and harmless: auto mode keeps working, its classifier requests are treated as normal requests.
+
+Why: classifier verdicts come from the upstream model server. This proxy's upstream is OpenCode Zen (OpenAI-compatible), which has no classifier-review mechanism and never returns `safeguard_results` — there is nothing to forward, and faking verdicts would be unsafe. What the gateway does guarantee:
+
+- Unknown request fields (e.g. `safeguards`) are accepted and ignored, never a 400.
+- Client tool-use ids round-trip unmodified whenever the upstream echoes them.
+
 ## Known Limitations
 
 Honest list of things that are stubbed, partial, or intentional hacks:
@@ -230,7 +239,7 @@ Honest list of things that are stubbed, partial, or intentional hacks:
 - **Decoy tools.** Every upstream request injects `bash` / `glob` / `grep` / `read` fingerprint tools that are stripped from outputs. Upstream behavior may change if Zen starts validating these.
 - **Model list is filtered.** Only `*free*` models plus `big-pickle` are kept, with an anti-shrink guard. Alias and deprecation lists are hardcoded.
 - **Upstream coupling.** All traffic goes to `opencode.ai/zen/v1/*` with a forged `opencode/...` User-Agent. Upstream changes can break the proxy at any time.
-- **Tests are unit-only.** 117 tests cover `lib/` converters, errors, models, and fallback. `server.mjs` routes have no integration tests.
+- **Tests are unit-only.** 123 tests cover `lib/` converters, errors, models, and fallback. `server.mjs` routes have no integration tests.
 - **Intentional spec deviations (Anthropic path).** `max_tokens: 0` returns an empty pre-warm message without an upstream call (extension, not Anthropic behavior). Attribution detection matches any leading `system` text containing both `cc_version=` and `cch=` — a `system` prompt that merely mentions those substrings alongside real instructions is dropped as a whole. `thinking: between_tools` maps to `reasoning_effort: none`.
 
 ## Project Structure

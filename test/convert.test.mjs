@@ -445,6 +445,47 @@ describe("anthropicParamsToChat effort mapping", () => {
 });
 
 describe("anthropicToOpenAI gateway handling", () => {
+  it("ignores unknown classifier fields like safeguards instead of failing", () => {
+    const out = anthropicToOpenAI({
+      model: "m",
+      max_tokens: 64,
+      safeguards: [{ type: "auto_mode_classifier", whatever: true }],
+      some_future_field: { nested: [1, 2, 3] },
+      system: "sys",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert.equal(out.messages.length, 2);
+    assert.ok(!("safeguards" in out.params), "safeguards must not leak into upstream params");
+    assert.ok(!("some_future_field" in out.params));
+    assert.equal(validateAnthropicMessagesBody({
+      model: "m",
+      max_tokens: 64,
+      safeguards: [],
+      messages: [{ role: "user", content: "hi" }],
+    }), null);
+  });
+  it("round-trips tool-use ids without rewriting them", () => {
+    const out = anthropicToOpenAI({
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_abc123", name: "read", input: { p: 1 } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_abc123", content: "file!" }] },
+      ],
+    });
+    assert.equal(out.messages[0].tool_calls[0].id, "toolu_abc123");
+    assert.equal(out.messages[1].tool_call_id, "toolu_abc123");
+    const back = openAIToAnthropic({
+      id: "chatcmpl-1",
+      choices: [{
+        message: {
+          content: null,
+          tool_calls: [{ id: "toolu_abc123", function: { name: "read", arguments: "{}" } }],
+        },
+        finish_reason: "tool_calls",
+      }],
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    }, "m", 0);
+    assert.equal(back.content[0].id, "toolu_abc123");
+  });
   it("strips the attribution block from system arrays", () => {
     const out = anthropicToOpenAI({
       system: [
