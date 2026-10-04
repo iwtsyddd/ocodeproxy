@@ -56,9 +56,20 @@ function setupProxyAgent(proxyUrl) {
       upstreamProxyUrl = `http://${url}`;
     }
   } catch (err) {
+    console.error(pc.yellow(`Invalid upstream proxy URL, falling back to direct connection: ${err?.message || err}`));
     upstreamProxyAgent = null;
     upstreamProxyUrl = "";
   }
+}
+
+function applyUpstreamProxy(options) {
+  if (!options || typeof options !== "object") return options;
+  if (upstreamProxyAgent) {
+    options.agent = upstreamProxyAgent;
+  } else if ("agent" in options) {
+    delete options.agent;
+  }
+  return options;
 }
 
 function saveProxyConfig() {
@@ -94,9 +105,7 @@ function fetchLatestOcVersion() {
       },
       timeout: 10000,
     };
-    if (upstreamProxyAgent) {
-      options.agent = upstreamProxyAgent;
-    }
+    applyUpstreamProxy(options);
 
     const req = https.request(options, (res) => {
       let data = "";
@@ -123,22 +132,29 @@ function fetchLatestOcVersion() {
 
 async function updateOcVersion(silent = false) {
   const latest = await fetchLatestOcVersion();
-  lastOcVersionCheck = Date.now();
-  if (latest && latest !== ocVersion) {
-    const prev = ocVersion;
-    ocVersion = latest;
-    if (!silent) {
-      console.log(pc.green(`✔ Updated OpenCode User-Agent version: ${prev} → ${pc.bold(latest)}`));
+  if (latest) {
+    lastOcVersionCheck = Date.now();
+    if (latest !== ocVersion) {
+      const prev = ocVersion;
+      ocVersion = latest;
+      if (!silent) {
+        console.log(pc.green(`✔ Updated OpenCode User-Agent version: ${prev} → ${pc.bold(latest)}`));
+      }
+      return { updated: true, version: latest, prev };
     }
-    return { updated: true, version: latest, prev };
+    return { updated: false, version: ocVersion, latest };
   }
-  return { updated: false, version: ocVersion, latest: latest || ocVersion };
+  lastOcVersionCheck = Date.now() - OC_VERSION_CHECK_INTERVAL + 15 * 60 * 1000;
+  return { updated: false, version: ocVersion, latest: null };
 }
 
+let ocVersionCheckInFlight = null;
 function checkPeriodicOcVersion() {
-  if (Date.now() - lastOcVersionCheck > OC_VERSION_CHECK_INTERVAL) {
-    updateOcVersion(true).catch(() => {});
-  }
+  if (Date.now() - lastOcVersionCheck <= OC_VERSION_CHECK_INTERVAL) return;
+  if (ocVersionCheckInFlight) return;
+  ocVersionCheckInFlight = updateOcVersion(true)
+    .catch(() => {})
+    .finally(() => { ocVersionCheckInFlight = null; });
 }
 
 function isPortAvailable(port) {
@@ -167,6 +183,7 @@ let currentPort = cliPort || (process.env.PROXY_PORT ? Number(process.env.PROXY_
 let currentServer = null;
 
 async function promptPortSelection(current) {
+  if (!process.stdin.isTTY) return null;
   const choice = await p.select({
     message: "Select port:",
     initialValue: String(current),
@@ -205,6 +222,10 @@ app.use((req, res, next) => {
   res.on("finish", () => {
     const duration = Date.now() - start;
     const time = new Date().toLocaleTimeString();
+    if (!process.stdout.isTTY) {
+      console.error(`[${time}] ${req.method.padEnd(6)} ${req.originalUrl.padEnd(24)} ${res.statusCode} ${duration}ms`);
+      return;
+    }
     const statusColor =
       res.statusCode >= 500
         ? pc.red
@@ -231,29 +252,74 @@ function generateKeyString() {
   return "ocp-" + crypto.randomBytes(20).toString("hex");
 }
 
+function maskKey(key) {
+  if (typeof key !== "string" || key.length < 8) return "****";
+  return `${key.slice(0, 7)}…****…${key.slice(-4)}`;
+}
+
 function saveKeys() {
-  fs.writeFileSync(KEYS_FILE, JSON.stringify(apiKeys, null, 2), "utf8");
+  try {
+    const tmpFile = `${KEYS_FILE}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(apiKeys, null, 2), { encoding: "utf8", mode: 0o600 });
+    try {
+      fs.chmodSync(tmpFile, 0o600);
+    } catch {}
+    fs.renameSync(tmpFile, KEYS_FILE);
+  } catch (err) {
+    console.error(pc.red(`Failed to save API keys: ${err?.message || err}`));
+  }
+}
+
+function isValidKeysObject(obj) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+  const entries = Object.entries(obj);
+  if (entries.length === 0) return false;
+  return entries.every(([name, key]) => typeof name === "string" && name.length > 0 && typeof key === "string" && key.length > 0);
 }
 
 function loadKeys() {
+  let raw = null;
   try {
-    apiKeys = JSON.parse(fs.readFileSync(KEYS_FILE, "utf8"));
-  } catch {}
-  if (Object.keys(apiKeys).length === 0) {
-    apiKeys = {
-      admin: generateKeyString(),
-      "user-default": generateKeyString(),
-    };
-    saveKeys();
+    raw = fs.readFileSync(KEYS_FILE, "utf8");
+  } catch (err) {
+    if (err?.code !== "ENOENT") {
+      console.error(pc.red(`Failed to read API keys file: ${err?.message || err}`));
+    }
   }
+  if (raw != null) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (!isValidKeysObject(parsed)) throw new Error("keys file must be a non-empty object of name-to-key strings");
+      apiKeys = parsed;
+      return;
+    } catch (err) {
+      const backupFile = `${KEYS_FILE}.corrupt-${Date.now()}.bak`;
+      try {
+        fs.writeFileSync(backupFile, raw, "utf8");
+        console.error(pc.yellow(`API keys file is corrupt, backed up to ${backupFile}: ${err?.message || err}`));
+      } catch (backupErr) {
+        console.error(pc.red(`API keys file is corrupt and backup failed: ${backupErr?.message || backupErr}`));
+      }
+    }
+  }
+  apiKeys = {
+    admin: generateKeyString(),
+    "user-default": generateKeyString(),
+  };
+  saveKeys();
 }
 loadKeys();
 
 function auth(req) {
-  const hdr = req.headers.authorization || req.headers["x-api-key"] || "";
+  const raw = req.headers.authorization ?? req.headers["x-api-key"] ?? "";
+  const hdr = Array.isArray(raw) ? raw[0] ?? "" : raw;
+  if (typeof hdr !== "string") return null;
   const tok = hdr.startsWith("Bearer ") ? hdr.slice(7) : hdr;
+  const tokBuf = Buffer.from(tok);
   for (const [name, key] of Object.entries(apiKeys)) {
-    if (tok === key) return name;
+    if (typeof key !== "string" || !key) continue;
+    const keyBuf = Buffer.from(key);
+    if (tokBuf.length === keyBuf.length && crypto.timingSafeEqual(tokBuf, keyBuf)) return name;
   }
   return null;
 }
@@ -313,13 +379,43 @@ function buildZenHeaders(sessionId, requestId, isStream = false, bodyLength = 0)
   return headers;
 }
 
+function openAIContentToResponsesText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((p) => {
+      if (typeof p?.text === "string") return p.text;
+      if (typeof p === "string") return p;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function openAIContentToResponsesInput(content) {
+  if (typeof content === "string") return [{ type: "input_text", text: content }];
+  if (!Array.isArray(content)) return [{ type: "input_text", text: "" }];
+  const parts = [];
+  for (const p of content) {
+    if (!p || typeof p !== "object") continue;
+    if ((p.type === "text" || p.type === "input_text") && typeof p.text === "string") {
+      parts.push({ type: "input_text", text: p.text });
+    } else if (p.type === "image_url" && p.image_url?.url) {
+      parts.push({ type: "input_image", image_url: p.image_url.url });
+    } else if (p.type === "input_image" && p.image_url) {
+      parts.push({ type: "input_image", image_url: p.image_url });
+    }
+  }
+  return parts.length ? parts : [{ type: "input_text", text: "" }];
+}
+
 function chatToResponses(targetModel, messages, tools, tool_choice) {
   let instructions = undefined;
   const input = [];
 
   for (const m of messages || []) {
     if (m.role === "system" || m.role === "developer") {
-      const t = typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
+      const t = openAIContentToResponsesText(m.content);
       if (t) instructions = instructions ? instructions + "\n" + t : t;
       continue;
     }
@@ -327,13 +423,14 @@ function chatToResponses(targetModel, messages, tools, tool_choice) {
       input.push({
         type: "function_call_output",
         call_id: m.tool_call_id,
-        output: typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? ""),
+        output: openAIContentToResponsesText(m.content),
       });
       continue;
     }
     if (m.role === "assistant" && m.tool_calls?.length) {
-      if (m.content) {
-        input.push({ role: "assistant", content: [{ type: "output_text", text: m.content }] });
+      const text = openAIContentToResponsesText(m.content);
+      if (text) {
+        input.push({ role: "assistant", content: [{ type: "output_text", text }] });
       }
       for (const tc of m.tool_calls) {
         input.push({
@@ -345,11 +442,14 @@ function chatToResponses(targetModel, messages, tools, tool_choice) {
       }
       continue;
     }
-    const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
     if (m.role === "assistant") {
-      input.push({ role: "assistant", content: [{ type: "output_text", text }] });
+      const content = [];
+      const text = openAIContentToResponsesText(m.content);
+      if (text) content.push({ type: "output_text", text });
+      if (typeof m.refusal === "string" && m.refusal) content.push({ type: "refusal", refusal: m.refusal });
+      input.push({ role: "assistant", content: content.length ? content : [{ type: "output_text", text: "" }] });
     } else {
-      input.push({ role: m.role === "developer" ? "user" : m.role, content: [{ type: "input_text", text }] });
+      input.push({ role: "user", content: openAIContentToResponsesInput(m.content) });
     }
   }
 
@@ -398,14 +498,13 @@ function ensureFingerprintTools(tools) {
 }
 
 function ensureAssistantReasoning(messages) {
-  for (const m of messages || []) {
-    if (m && typeof m === "object" && m.role === "assistant") {
-      if (typeof m.reasoning_content !== "string") {
-        m.reasoning_content = "";
-      }
+  if (!Array.isArray(messages)) return messages;
+  return messages.map((m) => {
+    if (m && typeof m === "object" && m.role === "assistant" && typeof m.reasoning_content !== "string") {
+      return { ...m, reasoning_content: "" };
     }
-  }
-  return messages;
+    return m;
+  });
 }
 
 function zenRequest(model, messages, _stream, tools, tool_choice, sessionId) {
@@ -437,9 +536,7 @@ function zenRequest(model, messages, _stream, tools, tool_choice, sessionId) {
     headers,
     timeout: 120000,
   };
-  if (upstreamProxyAgent) {
-    options.agent = upstreamProxyAgent;
-  }
+  applyUpstreamProxy(options);
 
   return {
     body,
@@ -464,9 +561,7 @@ function zenResponsesRequest(targetModel, messages, _stream, tools, tool_choice,
     headers,
     timeout: 120000,
   };
-  if (upstreamProxyAgent) {
-    options.agent = upstreamProxyAgent;
-  }
+  applyUpstreamProxy(options);
 
   return {
     body,
@@ -535,7 +630,7 @@ function loadModels() {
 loadModels();
 
 function isDeprecatedModel(model) {
-  return DISCONTINUED_MODELS.has(model);
+  return DISCONTINUED_MODELS.has(model) || DISCONTINUED_MODELS.has(resolveModel(model));
 }
 
 function resolveModel(model) {
@@ -543,13 +638,28 @@ function resolveModel(model) {
 }
 
 function isResponsesModel(model) {
-  const resolved = resolveModel(model);
-  return RESPONSES_SET.has(resolved) || resolved.startsWith("muse-spark");
+  return RESPONSES_SET.has(resolveModel(model));
 }
 
 function isKnownModel(model) {
   const resolved = resolveModel(model);
   return ALL_MODELS.includes(model) || ALL_MODELS.includes(resolved);
+}
+
+const MODELS_REFRESH_DEBOUNCE = 5 * 60 * 1000;
+let refreshInFlight = null;
+async function maybeRefreshModels() {
+  if (Date.now() - lastModelsFetchTime <= MODELS_REFRESH_DEBOUNCE) return;
+  if (refreshInFlight) {
+    await refreshInFlight.catch(() => {});
+    return;
+  }
+  refreshInFlight = refreshModels(true).catch(() => false);
+  try {
+    await refreshInFlight;
+  } finally {
+    refreshInFlight = null;
+  }
 }
 
 function fetchUpstreamModels() {
@@ -571,9 +681,7 @@ function fetchUpstreamModels() {
       headers,
       timeout: 15000,
     };
-    if (upstreamProxyAgent) {
-      options.agent = upstreamProxyAgent;
-    }
+    applyUpstreamProxy(options);
 
     const req = https.request(options, (res) => {
       let data = "";
@@ -617,9 +725,25 @@ function fetchUpstreamModels() {
   });
 }
 
-async function refreshModels(silent = false) {
+async function refreshModels(silent = false, opts = {}) {
   const result = await fetchUpstreamModels();
   if (result) {
+    const total = result.chat.length + result.responses.length;
+    if (ALL_MODELS.length > 0 && total < ALL_MODELS.length) {
+      lastModelsFetchTime = Date.now();
+      console.log(pc.yellow(`Upstream returned only ${total} models (have ${ALL_MODELS.length}), keeping current list.`));
+      return false;
+    }
+    if (CHAT_MODELS.length > 0 && result.chat.length === 0) {
+      lastModelsFetchTime = Date.now();
+      console.log(pc.yellow(`Upstream returned no chat models (have ${CHAT_MODELS.length}), keeping current list.`));
+      return false;
+    }
+    if (RESPONSES_MODELS.length > 0 && result.responses.length === 0) {
+      lastModelsFetchTime = Date.now();
+      console.log(pc.yellow(`Upstream returned no responses models (have ${RESPONSES_MODELS.length}), keeping current list.`));
+      return false;
+    }
     CHAT_MODELS = result.chat;
     RESPONSES_MODELS = result.responses;
     ALL_MODELS = [...CHAT_MODELS, ...RESPONSES_MODELS];
@@ -631,17 +755,31 @@ async function refreshModels(silent = false) {
     }
     return true;
   }
+  lastModelsFetchTime = Date.now();
   return false;
 }
 
 function responsesToOpenAI(resp, requestedModel) {
   let text = "";
+  let refusal = "";
+  let reasoning = "";
+  const annotations = [];
   const toolCalls = [];
   for (const item of resp?.output || []) {
     if (item.type === "message") {
       for (const c of item.content || []) {
-        if (c.type === "output_text" && c.text) text += c.text;
+        if (c.type === "output_text" && c.text) {
+          text += c.text;
+          if (Array.isArray(c.annotations)) annotations.push(...c.annotations);
+        } else if (c.type === "refusal" && c.refusal) {
+          refusal += c.refusal;
+        }
       }
+    } else if (item.type === "reasoning") {
+      for (const s of item.summary || []) {
+        if (typeof s?.text === "string") reasoning += s.text;
+      }
+      if (typeof item.content === "string" && item.content) reasoning += item.content;
     } else if (item.type === "function_call") {
       toolCalls.push({
         id: item.call_id || item.id || ocId("call"),
@@ -649,6 +787,14 @@ function responsesToOpenAI(resp, requestedModel) {
         function: { name: item.name || "", arguments: item.arguments || "{}" },
       });
     }
+  }
+
+  let finishReason = "stop";
+  if (toolCalls.length) {
+    finishReason = "tool_calls";
+  } else if (resp?.status === "incomplete") {
+    const why = resp?.incomplete_details?.reason;
+    finishReason = why === "max_output_tokens" ? "length" : why === "content_filter" ? "content_filter" : "stop";
   }
 
   return {
@@ -661,9 +807,12 @@ function responsesToOpenAI(resp, requestedModel) {
       message: {
         role: "assistant",
         content: text || null,
+        ...(refusal ? { refusal } : {}),
+        ...(reasoning ? { reasoning_content: reasoning } : {}),
+        ...(annotations.length ? { annotations } : {}),
         ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
       },
-      finish_reason: toolCalls.length ? "tool_calls" : "stop",
+      finish_reason: finishReason,
     }],
     usage: {
       prompt_tokens: resp?.usage?.input_tokens || 0,
@@ -673,29 +822,43 @@ function responsesToOpenAI(resp, requestedModel) {
   };
 }
 
-function responsesErrorStatus(data) {
+function responsesErrorStatus(data, fallbackStatus) {
   const msg = data?.error?.message || data?.message || "";
   if (data?.error?.code === "rate_limit_exceeded" || data?.error?.type === "rate_limit_error" || /rate_limit|Rate limit/i.test(msg)) {
     return 429;
   }
-  return null;
+  const fb = Number(fallbackStatus);
+  if (Number.isInteger(fb) && fb >= 400 && fb <= 599) return fb;
+  return 502;
 }
 
 function mapZenError(status, errData, format = "openai") {
   let rawMsg = errData?.error?.message || errData?.message || "Upstream error";
-  let code = errData?.error?.code || (status === 429 ? "rate_limit_exceeded" : "upstream_error");
-  let type = errData?.error?.type || (status === 429 ? "rate_limit_error" : status === 401 ? "authentication_error" : "upstream_error");
-  let finalStatus = status || 502;
+  let finalStatus = Number(status) || 502;
+  if (finalStatus < 400) finalStatus = 502;
+  let code = errData?.error?.code || (finalStatus === 429 ? "rate_limit_exceeded" : "upstream_error");
+  let type = errData?.error?.type || "upstream_error";
 
-  if (status === 429 || /rate_limit|FreeUsageLimitError/i.test(rawMsg)) {
+  if (finalStatus === 429 || /rate_limit|FreeUsageLimitError/i.test(rawMsg)) {
     finalStatus = 429;
     type = "rate_limit_error";
     code = "rate_limit_exceeded";
     rawMsg = `${rawMsg} (free model rate limit)`;
-  } else if (status === 401) {
+  } else if (finalStatus === 400) {
+    type = "invalid_request_error";
+    if (code === "upstream_error") code = "invalid_request_error";
+  } else if (finalStatus === 401) {
     type = "authentication_error";
-  } else if (status === 403) {
+    if (code === "upstream_error") code = "invalid_api_key";
+  } else if (finalStatus === 403) {
     type = "permission_error";
+    if (code === "upstream_error") code = "permission_denied";
+  } else if (finalStatus === 404) {
+    type = "not_found_error";
+    if (code === "upstream_error") code = "not_found";
+  } else if (finalStatus >= 500) {
+    type = "api_error";
+    if (code === "upstream_error") code = "internal_server_error";
   }
 
   if (format === "anthropic") {
@@ -704,19 +867,50 @@ function mapZenError(status, errData, format = "openai") {
   return { status: finalStatus, body: { error: { message: rawMsg, type, code } } };
 }
 
+function publicNetworkMessage(err) {
+  const msg = err?.message || String(err || "");
+  if (/timeout|timed out|ETIMEDOUT|ESOCKETTIMEDOUT/i.test(msg)) return "Upstream timeout";
+  if (/ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EPIPE|EAI_AGAIN|socket hang up|ECONNABORTED|network/i.test(msg)) {
+    return "Upstream connection failed";
+  }
+  return "Upstream request failed";
+}
+
+function detectUpstreamError(raw) {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return { needMore: true };
+  if (trimmed.startsWith("data:") || trimmed.includes("\ndata:") || trimmed.includes("\r\ndata:")) {
+    return { needMore: false, isStream: true };
+  }
+  if (!trimmed.startsWith("{")) return { needMore: false, isStream: true };
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && (parsed.error || parsed.type === "error" || /FreeTierError|FreeUsageLimitError|rate_limit/i.test(trimmed))) {
+      return { needMore: false, isStream: false, parsed };
+    }
+    return { needMore: false, isStream: true };
+  } catch {
+    if (trimmed.length < 65536) return { needMore: true };
+    return { needMore: false, isStream: true };
+  }
+}
+
 function zenRequestFull(zenOpts, body) {
   return new Promise((resolve, reject) => {
+    applyUpstreamProxy(zenOpts);
     const req = https.request(zenOpts, (zenRes) => {
       const chunks = [];
       zenRes.on("data", (c) => chunks.push(c));
       zenRes.on("end", () => {
         const raw = Buffer.concat(chunks).toString();
+        const headers = zenRes.headers || {};
         try {
-          resolve({ status: zenRes.statusCode, data: JSON.parse(raw), raw });
+          resolve({ status: zenRes.statusCode, data: JSON.parse(raw), raw, headers });
         } catch {
-          resolve({ status: zenRes.statusCode, data: null, raw });
+          resolve({ status: zenRes.statusCode, data: null, raw, headers });
         }
       });
+      zenRes.on("error", reject);
     });
     req.on("error", reject);
     req.on("timeout", () => { req.destroy(); reject(new Error("Upstream timeout")); });
@@ -725,21 +919,35 @@ function zenRequestFull(zenOpts, body) {
   });
 }
 
+function retryAfterMs(headers, fallbackMs) {
+  const raw = Array.isArray(headers?.["retry-after"]) ? headers["retry-after"][0] : headers?.["retry-after"];
+  if (raw == null) return fallbackMs;
+  const secs = Number(String(raw).trim());
+  if (Number.isFinite(secs)) return Math.min(Math.max(secs * 1000, 0), 15000);
+  const at = Date.parse(String(raw));
+  if (!Number.isNaN(at)) return Math.min(Math.max(at - Date.now(), 0), 15000);
+  return fallbackMs;
+}
+
 async function executeWithRetry(requestFn, maxRetries = 1) {
   let attempt = 0;
+  let delayMs = 500;
   while (true) {
     try {
       const resp = await requestFn();
-      if ((resp.status >= 500 || resp.status === 429) && attempt < maxRetries) {
+      if ((resp.status === 429 || resp.status >= 500) && attempt < maxRetries) {
         attempt++;
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        delayMs = retryAfterMs(resp.headers, delayMs);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        delayMs = Math.min(delayMs * 2, 5000);
         continue;
       }
       return resp;
     } catch (err) {
+      if (err?.upstreamStarted) throw err;
       if (attempt < maxRetries) {
         attempt++;
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
         continue;
       }
       throw err;
@@ -756,6 +964,7 @@ function aggregateSseToCompletion(raw, model = "") {
   const toolCalls = {};
   let finish = "stop";
 
+  let upstreamUsage = null;
   for (const line of String(raw).split(/\r?\n/)) {
     if (!line.startsWith("data: ")) continue;
     const payload = line.slice(6).trim();
@@ -769,6 +978,7 @@ function aggregateSseToCompletion(raw, model = "") {
     if (parsed.id) id = parsed.id;
     if (parsed.created) created = parsed.created;
     if (parsed.model) outModel = parsed.model;
+    if (parsed.usage && typeof parsed.usage === "object") upstreamUsage = parsed.usage;
     const choice = parsed.choices?.[0];
     if (!choice) continue;
     const d = choice.delta || {};
@@ -809,17 +1019,26 @@ function aggregateSseToCompletion(raw, model = "") {
       },
       finish_reason: calls.length ? "tool_calls" : finish || "stop",
     }],
-    usage: {
-      prompt_tokens: Math.ceil(content.length / 4),
-      completion_tokens: Math.ceil((content.length + reasoning.length) / 4),
-      total_tokens: Math.ceil((content.length * 2 + reasoning.length) / 4),
+    usage: upstreamUsage ? {
+      prompt_tokens: upstreamUsage.prompt_tokens ?? upstreamUsage.input_tokens ?? 0,
+      completion_tokens: upstreamUsage.completion_tokens ?? upstreamUsage.output_tokens ?? 0,
+      total_tokens: upstreamUsage.total_tokens ?? 0,
+    } : {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
     },
   };
 }
 
 function aggregateResponsesSseToOpenAI(raw, requestedModel) {
   let text = "";
+  let refusal = "";
+  let reasoning = "";
   const toolCalls = {};
+  let upstreamUsage = null;
+  let respStatus = null;
+  let incompleteReason = null;
   for (const line of String(raw).split(/\r?\n/)) {
     if (!line.startsWith("data: ")) continue;
     const payload = line.slice(6).trim();
@@ -828,6 +1047,10 @@ function aggregateResponsesSseToOpenAI(raw, requestedModel) {
     try { ev = JSON.parse(payload); } catch { continue; }
     if (ev.type === "response.output_text.delta" && ev.delta) {
       text += ev.delta;
+    } else if ((ev.type === "response.reasoning_summary_text.delta" || ev.type === "response.reasoning_text.delta") && ev.delta) {
+      reasoning += ev.delta;
+    } else if (ev.type === "response.refusal.delta" && ev.delta) {
+      refusal += ev.delta;
     } else if (ev.type === "response.output_item.added" && ev.item?.type === "function_call") {
       const idx = Object.keys(toolCalls).length;
       toolCalls[ev.item.id] = { index: idx, id: ev.item.call_id || ev.item.id, name: ev.item.name || "", arguments: "" };
@@ -835,6 +1058,11 @@ function aggregateResponsesSseToOpenAI(raw, requestedModel) {
       if (toolCalls[ev.item_id]) {
         toolCalls[ev.item_id].arguments += ev.delta;
       }
+    } else if (ev.type === "response.completed" || ev.type === "response.incomplete" || ev.type === "response.failed") {
+      const resp = ev.response || {};
+      if (resp.status) respStatus = resp.status;
+      if (resp.incomplete_details?.reason) incompleteReason = resp.incomplete_details.reason;
+      if (resp.usage && typeof resp.usage === "object") upstreamUsage = resp.usage;
     }
   }
 
@@ -843,6 +1071,13 @@ function aggregateResponsesSseToOpenAI(raw, requestedModel) {
     type: "function",
     function: { name: tc.name, arguments: tc.arguments || "{}" },
   }));
+
+  let finishReason = "stop";
+  if (calls.length) {
+    finishReason = "tool_calls";
+  } else if (respStatus === "incomplete") {
+    finishReason = incompleteReason === "max_output_tokens" ? "length" : incompleteReason === "content_filter" ? "content_filter" : "stop";
+  }
 
   return {
     id: ocId("chatcmpl"),
@@ -854,62 +1089,163 @@ function aggregateResponsesSseToOpenAI(raw, requestedModel) {
       message: {
         role: "assistant",
         content: text || null,
+        ...(refusal ? { refusal } : {}),
+        ...(reasoning ? { reasoning_content: reasoning } : {}),
         ...(calls.length ? { tool_calls: calls } : {}),
       },
-      finish_reason: calls.length ? "tool_calls" : "stop",
+      finish_reason: finishReason,
     }],
-    usage: {
-      prompt_tokens: Math.ceil(text.length / 4),
-      completion_tokens: Math.ceil(text.length / 4),
-      total_tokens: Math.ceil(text.length / 2),
+    usage: upstreamUsage ? {
+      prompt_tokens: upstreamUsage.input_tokens ?? 0,
+      completion_tokens: upstreamUsage.output_tokens ?? 0,
+      total_tokens: upstreamUsage.total_tokens ?? 0,
+    } : {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
     },
   };
 }
 
 function collectZenSse(zenOpts, body) {
   return new Promise((resolve, reject) => {
+    applyUpstreamProxy(zenOpts);
+    let receivedBytes = 0;
+    const markStarted = (err) => {
+      if (receivedBytes > 0) err.upstreamStarted = true;
+      return err;
+    };
     const req = https.request(zenOpts, (zenRes) => {
       const chunks = [];
-      zenRes.on("data", (c) => chunks.push(c));
+      zenRes.on("data", (c) => {
+        receivedBytes += c.length;
+        chunks.push(c);
+      });
       zenRes.on("end", () => {
         const raw = Buffer.concat(chunks).toString();
-        const trimmed = raw.trim();
-        if (trimmed.startsWith("{") && (trimmed.includes('"error"') || trimmed.includes("FreeTierError") || trimmed.includes("FreeUsageLimitError") || trimmed.includes("rate_limit"))) {
-          try {
-            const errObj = JSON.parse(trimmed);
-            if (errObj.error || errObj.type === "error") {
-              return resolve({ status: zenRes.statusCode >= 400 ? zenRes.statusCode : 403, error: errObj });
-            }
-          } catch {}
+        const headers = zenRes.headers || {};
+        const det = detectUpstreamError(raw);
+        if (!det.needMore && !det.isStream && det.parsed) {
+          const fb = zenRes.statusCode >= 400 ? zenRes.statusCode : 502;
+          return resolve({ status: responsesErrorStatus(det.parsed, fb), error: det.parsed, headers });
         }
-        resolve({ status: zenRes.statusCode, raw });
+        resolve({ status: zenRes.statusCode, raw, headers });
       });
+      zenRes.on("error", (e) => reject(markStarted(e)));
     });
-    req.on("error", reject);
+    req.on("error", (e) => reject(markStarted(e)));
     req.on("timeout", () => { req.destroy(); reject(new Error("Upstream timeout")); });
     req.write(body);
     req.end();
   });
 }
 
+function anthropicImageToOpenAI(b) {
+  const src = b?.source || {};
+  if (src.type === "base64" && src.data) {
+    const mime = src.media_type || "image/jpeg";
+    return { type: "image_url", image_url: { url: `data:${mime};base64,${src.data}` } };
+  }
+  if (src.type === "url" && src.url) return { type: "image_url", image_url: { url: src.url } };
+  if (typeof b?.url === "string") return { type: "image_url", image_url: { url: b.url } };
+  return null;
+}
+
+function anthropicDocumentText(b) {
+  if (typeof b?.text === "string") return b.text;
+  const src = b?.source || {};
+  if (typeof src.text === "string") return src.text;
+  if (typeof src.data === "string") {
+    if (src.type === "text" || src.media_type === "text/plain") {
+      try {
+        return Buffer.from(src.data, "base64").toString("utf8");
+      } catch {
+        return src.data;
+      }
+    }
+    return `[document: ${b?.title || src.media_type || "binary"}]`;
+  }
+  if (src.type === "url" && src.url) return `[document: ${src.url}]`;
+  if (typeof b?.title === "string" && b.title) return `[document: ${b.title}]`;
+  return "";
+}
+
+function anthropicToolResultText(b) {
+  let raw = "";
+  if (typeof b?.content === "string") raw = b.content;
+  else if (Array.isArray(b?.content)) {
+    const parts = [];
+    for (const c of b.content) {
+      if (!c || typeof c !== "object") continue;
+      if (c.type === "text" && typeof c.text === "string") parts.push(c.text);
+      else if (c.type === "image") {
+        const img = anthropicImageToOpenAI(c);
+        if (img) parts.push(`[image: ${img.image_url.url.slice(0, 200)}]`);
+      } else if (c.type === "document") {
+        const t = anthropicDocumentText(c);
+        if (t) parts.push(t);
+      } else if (typeof c.text === "string") parts.push(c.text);
+    }
+    raw = parts.join("\n");
+  } else if (b?.content != null) raw = String(b.content);
+  if (b?.is_error) raw = raw ? `[tool_error] ${raw}` : "[tool_error]";
+  return raw;
+}
+
+function pickCacheControl(b) {
+  const cc = b?.cache_control;
+  if (cc && typeof cc === "object" && !Array.isArray(cc)) return cc;
+  return undefined;
+}
+
 function anthropicToOpenAI(body) {
   const messages = [];
   if (body.system) {
     const sys = typeof body.system === "string" ? body.system
-      : Array.isArray(body.system) ? body.system.map((b) => b.text || "").join("\n") : "";
-    if (sys) messages.push({ role: "system", content: sys });
+      : Array.isArray(body.system) ? body.system.map((b) => (typeof b?.text === "string" ? b.text : "")).join("\n") : "";
+    if (sys) {
+      const sysMsg = { role: "system", content: sys };
+      if (Array.isArray(body.system)) {
+        for (const b of body.system) {
+          const cc = pickCacheControl(b);
+          if (cc) { sysMsg.cache_control = cc; break; }
+        }
+      }
+      messages.push(sysMsg);
+    }
   }
   for (const msg of body.messages || []) {
     if (typeof msg.content === "string") {
-      messages.push({ role: msg.role, content: msg.content });
+      const out = { role: msg.role, content: msg.content };
+      const cc = pickCacheControl(msg);
+      if (cc) out.cache_control = cc;
+      messages.push(out);
     } else if (Array.isArray(msg.content)) {
-      const text = msg.content
-        .filter((b) => b.type === "text")
-        .map((b) => b.text)
-        .join("\n");
-      const toolUses = msg.content.filter((b) => b.type === "tool_use");
+      const textParts = [];
+      const imageParts = [];
+      const toolUses = [];
+      const toolResults = [];
+      let blockCacheControl;
+      for (const b of msg.content) {
+        if (!b || typeof b !== "object") continue;
+        const cc = pickCacheControl(b);
+        if (cc && !blockCacheControl) blockCacheControl = cc;
+        if (b.type === "text" && typeof b.text === "string") textParts.push(b.text);
+        else if (b.type === "image") {
+          const img = anthropicImageToOpenAI(b);
+          if (img) {
+            if (cc) img.cache_control = cc;
+            imageParts.push(img);
+          }
+        } else if (b.type === "document") {
+          const t = anthropicDocumentText(b);
+          if (t) textParts.push(t);
+        } else if (b.type === "tool_use") toolUses.push(b);
+        else if (b.type === "tool_result") toolResults.push(b);
+      }
+      const text = textParts.join("\n");
       if (toolUses.length && msg.role === "assistant") {
-        messages.push({
+        const out = {
           role: "assistant",
           content: text || null,
           tool_calls: toolUses.map((t) => ({
@@ -917,39 +1253,84 @@ function anthropicToOpenAI(body) {
             type: "function",
             function: { name: t.name, arguments: JSON.stringify(t.input || {}) },
           })),
-        });
-      } else if (msg.content.some((b) => b.type === "tool_result")) {
-        for (const b of msg.content.filter((b) => b.type === "tool_result")) {
-          const resultText = typeof b.content === "string" ? b.content
-            : Array.isArray(b.content) ? b.content.map((c) => c.text || "").join("\n") : "";
-          messages.push({ role: "tool", tool_call_id: b.tool_use_id, content: resultText });
+        };
+        if (blockCacheControl) out.cache_control = blockCacheControl;
+        messages.push(out);
+      } else if (toolResults.length) {
+        if (text || imageParts.length) {
+          if (imageParts.length) {
+            const parts = [];
+            if (text) {
+              const tp = { type: "text", text };
+              if (blockCacheControl) tp.cache_control = blockCacheControl;
+              parts.push(tp);
+            }
+            parts.push(...imageParts);
+            const out = { role: "user", content: parts };
+            messages.push(out);
+          } else {
+            const out = { role: "user", content: text };
+            if (blockCacheControl) out.cache_control = blockCacheControl;
+            messages.push(out);
+          }
         }
+        for (const b of toolResults) {
+          const out = { role: "tool", tool_call_id: b.tool_use_id, content: anthropicToolResultText(b) };
+          const cc = pickCacheControl(b);
+          if (cc) out.cache_control = cc;
+          messages.push(out);
+        }
+      } else if (imageParts.length) {
+        const parts = [];
+        if (text) {
+          const tp = { type: "text", text };
+          if (blockCacheControl) tp.cache_control = blockCacheControl;
+          parts.push(tp);
+        }
+        parts.push(...imageParts);
+        messages.push({ role: msg.role, content: parts });
       } else {
-        messages.push({ role: msg.role, content: text });
+        const out = { role: msg.role, content: text };
+        if (blockCacheControl) out.cache_control = blockCacheControl;
+        messages.push(out);
       }
     }
   }
 
-  const tools = (body.tools || []).map((t) => ({
-    type: "function",
-    function: {
-      name: t.name,
-      description: t.description || "",
-      parameters: t.input_schema || {},
-    },
-  }));
+  const tools = (body.tools || []).map((t) => {
+    const out = {
+      type: "function",
+      function: {
+        name: t.name,
+        description: t.description || "",
+        parameters: t.input_schema || {},
+      },
+    };
+    const cc = pickCacheControl(t);
+    if (cc) out.cache_control = cc;
+    return out;
+  });
 
   return { messages, tools: tools.length ? tools : undefined };
 }
 
 function openAIToAnthropic(oaiResp, model, inputTokens) {
+  let msgId = ocId("msg");
+  const rawId = oaiResp?.id != null ? String(oaiResp.id) : "";
+  if (rawId.startsWith("msg_")) {
+    msgId = rawId;
+  } else if (/^(chatcmpl[-_]|resp[-_]?)/.test(rawId)) {
+    msgId = rawId.replace(/^(chatcmpl[-_]|resp[-_]?)/, "msg_");
+  } else if (rawId) {
+    msgId = `msg_${rawId}`;
+  }
   const choice = oaiResp.choices?.[0];
   if (!choice) {
     return {
-      id: ocId("msg"),
+      id: msgId,
       type: "message",
       role: "assistant",
-      content: [{ type: "text", text: "" }],
+      content: [],
       model,
       stop_reason: "end_turn",
       usage: { input_tokens: inputTokens || 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -957,8 +1338,17 @@ function openAIToAnthropic(oaiResp, model, inputTokens) {
   }
 
   const content = [];
+  if (typeof choice.message?.reasoning_content === "string" && choice.message.reasoning_content) {
+    content.push({ type: "thinking", thinking: choice.message.reasoning_content });
+  }
   if (choice.message?.content) {
-    content.push({ type: "text", text: choice.message.content });
+    const text = Array.isArray(choice.message.content)
+      ? choice.message.content.map((p) => (typeof p?.text === "string" ? p.text : "")).filter(Boolean).join("\n")
+      : choice.message.content;
+    if (text) content.push({ type: "text", text });
+  }
+  if (typeof choice.message?.refusal === "string" && choice.message.refusal) {
+    content.push({ type: "text", text: choice.message.refusal });
   }
   if (choice.message?.tool_calls) {
     for (const tc of choice.message.tool_calls) {
@@ -972,23 +1362,23 @@ function openAIToAnthropic(oaiResp, model, inputTokens) {
       });
     }
   }
-  if (!content.length) content.push({ type: "text", text: "" });
 
   let stopReason = "end_turn";
   if (choice.finish_reason === "tool_calls") stopReason = "tool_use";
   else if (choice.finish_reason === "length") stopReason = "max_tokens";
+  else if (choice.finish_reason === "content_filter") stopReason = "refusal";
   else if (choice.finish_reason === "stop") stopReason = "end_turn";
 
   return {
-    id: ocId("msg"),
+    id: msgId,
     type: "message",
     role: "assistant",
     content,
     model,
     stop_reason: stopReason,
     usage: {
-      input_tokens: oaiResp.usage?.prompt_tokens || inputTokens || 0,
-      output_tokens: oaiResp.usage?.completion_tokens || 0,
+      input_tokens: oaiResp.usage?.prompt_tokens ?? inputTokens ?? 0,
+      output_tokens: oaiResp.usage?.completion_tokens ?? 0,
       cache_creation_input_tokens: 0,
       cache_read_input_tokens: 0,
     },
@@ -1033,30 +1423,36 @@ function pipeZenResponses(zenOpts, body, requestedModel, res) {
     res.end();
   }
 
+  applyUpstreamProxy(zenOpts);
   const req = https.request(zenOpts, (zenRes) => {
     zenRes.on("data", (chunk) => {
+      if (finished) return;
       const str = chunk.toString();
+      buffer += str;
       if (!firstChunkHandled) {
+        const det = detectUpstreamError(buffer);
+        if (det.needMore) return;
         firstChunkHandled = true;
-        const trimmed = str.trim();
-        if (trimmed.startsWith("{") && (trimmed.includes('"error"') || trimmed.includes("rate_limit"))) {
+        if (!det.isStream && det.parsed) {
+          const mapped = mapZenError(responsesErrorStatus(det.parsed, zenRes.statusCode), det.parsed, "openai");
+          finished = true;
           try {
-            const parsed = JSON.parse(trimmed);
-            if (parsed.error) {
-              const mapped = mapZenError(responsesErrorStatus(parsed) || zenRes.statusCode || 502, parsed, "openai");
-              if (!res.headersSent) {
-                res.status(mapped.status).json(mapped.body);
-              }
-              zenRes.resume();
-              finished = true;
-              return;
-            }
+            zenRes.resume();
           } catch {}
+          try {
+            req.destroy();
+          } catch {}
+          if (!res.headersSent && !res.writableEnded) {
+            res.status(mapped.status).json(mapped.body);
+          } else if (!res.writableEnded) {
+            try {
+              res.end();
+            } catch {}
+          }
+          return;
         }
       }
-      if (finished) return;
 
-      buffer += str;
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
 
@@ -1106,20 +1502,40 @@ function pipeZenResponses(zenOpts, body, requestedModel, res) {
     zenRes.on("end", () => {
       if (finished) return;
       if (!headersSent) {
-        if (!res.headersSent) {
+        finished = true;
+        if (!res.headersSent && !res.writableEnded) {
           const mapped = mapZenError(502, { message: "Empty response from upstream" }, "openai");
           res.status(mapped.status).json(mapped.body);
+        } else if (!res.writableEnded) {
+          try {
+            res.end();
+          } catch {}
         }
-        finished = true;
         return;
       }
       finish(toolMap.size ? "tool_calls" : "stop");
     });
+
+    zenRes.on("error", (e) => {
+      if (finished) return;
+      try {
+        req.destroy();
+      } catch {}
+      if (!headersSent && !res.headersSent) {
+        finished = true;
+        const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
+        res.status(mapped.status).json(mapped.body);
+      } else if (!finished) {
+        try { finish("stop"); } catch {}
+      }
+    });
   });
 
   req.on("error", (e) => {
+    if (finished || res.writableEnded) return;
     if (!res.headersSent && !headersSent) {
-      const mapped = mapZenError(502, { message: e.message }, "openai");
+      finished = true;
+      const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
       res.status(mapped.status).json(mapped.body);
     } else if (headersSent && !finished) {
       try { finish("stop"); } catch {}
@@ -1128,9 +1544,22 @@ function pipeZenResponses(zenOpts, body, requestedModel, res) {
 
   req.on("timeout", () => {
     req.destroy();
+    if (finished || res.writableEnded) return;
     if (!res.headersSent && !headersSent) {
+      finished = true;
       const mapped = mapZenError(504, { message: "Upstream timeout" }, "openai");
       res.status(mapped.status).json(mapped.body);
+    } else if (headersSent && !finished) {
+      try { finish("stop"); } catch {}
+    }
+  });
+
+  res.on("close", () => {
+    if (!finished) {
+      finished = true;
+      try {
+        req.destroy();
+      } catch {}
     }
   });
 
@@ -1186,30 +1615,36 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens) {
     res.end();
   }
 
+  applyUpstreamProxy(zenOpts);
   const req = https.request(zenOpts, (zenRes) => {
     zenRes.on("data", (chunk) => {
+      if (finished) return;
       const str = chunk.toString();
+      buffer += str;
       if (!firstChunkHandled) {
+        const det = detectUpstreamError(buffer);
+        if (det.needMore) return;
         firstChunkHandled = true;
-        const trimmed = str.trim();
-        if (trimmed.startsWith("{") && (trimmed.includes('"error"') || trimmed.includes("rate_limit"))) {
+        if (!det.isStream && det.parsed) {
+          const mapped = mapZenError(responsesErrorStatus(det.parsed, zenRes.statusCode), det.parsed, "anthropic");
+          finished = true;
           try {
-            const parsed = JSON.parse(trimmed);
-            if (parsed.error) {
-              const mapped = mapZenError(responsesErrorStatus(parsed) || zenRes.statusCode || 502, parsed, "anthropic");
-              if (!res.headersSent) {
-                res.status(mapped.status).json(mapped.body);
-              }
-              finished = true;
-              zenRes.resume();
-              return;
-            }
+            zenRes.resume();
           } catch {}
+          try {
+            req.destroy();
+          } catch {}
+          if (!res.headersSent && !res.writableEnded) {
+            res.status(mapped.status).json(mapped.body);
+          } else if (!res.writableEnded) {
+            try {
+              res.end();
+            } catch {}
+          }
+          return;
         }
       }
-      if (finished) return;
 
-      buffer += str;
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
 
@@ -1270,29 +1705,73 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens) {
     zenRes.on("end", () => {
       if (finished) return;
       if (!headersSent) {
-        if (!res.headersSent) {
+        finished = true;
+        if (!res.headersSent && !res.writableEnded) {
           const mapped = mapZenError(502, { message: "Empty response from upstream" }, "anthropic");
           res.status(mapped.status).json(mapped.body);
+        } else if (!res.writableEnded) {
+          try {
+            res.end();
+          } catch {}
         }
-        finished = true;
         return;
       }
       closeBlocksAndStop(toolEntries.length ? "tool_use" : "end_turn");
     });
+
+    zenRes.on("error", (e) => {
+      if (finished) return;
+      try {
+        req.destroy();
+      } catch {}
+      if (!headersSent && !res.headersSent) {
+        finished = true;
+        const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "anthropic");
+        res.status(mapped.status).json(mapped.body);
+      } else if (!finished) {
+        try {
+          sendHeaders();
+          closeBlocksAndStop("end_turn");
+        } catch {}
+      }
+    });
   });
 
   req.on("error", (e) => {
+    if (finished || res.writableEnded) return;
     if (!res.headersSent && !headersSent) {
-      const mapped = mapZenError(502, { message: e.message }, "anthropic");
+      finished = true;
+      const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "anthropic");
       res.status(mapped.status).json(mapped.body);
+    } else if (!finished) {
+      try {
+        sendHeaders();
+        closeBlocksAndStop("end_turn");
+      } catch {}
     }
   });
 
   req.on("timeout", () => {
     req.destroy();
+    if (finished || res.writableEnded) return;
     if (!res.headersSent && !headersSent) {
+      finished = true;
       const mapped = mapZenError(504, { message: "Upstream timeout" }, "anthropic");
       res.status(mapped.status).json(mapped.body);
+    } else if (!finished) {
+      try {
+        sendHeaders();
+        closeBlocksAndStop("end_turn");
+      } catch {}
+    }
+  });
+
+  res.on("close", () => {
+    if (!finished) {
+      finished = true;
+      try {
+        req.destroy();
+      } catch {}
     }
   });
 
@@ -1302,13 +1781,16 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens) {
 
 function pipeZenResponse(zenOpts, body, stream, res) {
   res.setHeader("x-zen-served-by", "ocodeproxy");
+  applyUpstreamProxy(zenOpts);
   const req = https.request(zenOpts, (zenRes) => {
     let firstChunk = null;
     let headersSent = false;
     let buffer = "";
+    let finished = false;
+    let firstChunkHandled = false;
 
     function sendHeaders() {
-      if (headersSent) return;
+      if (headersSent || finished) return;
       headersSent = true;
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -1321,32 +1803,44 @@ function pipeZenResponse(zenOpts, body, stream, res) {
     }
 
     zenRes.on("data", (chunk) => {
+      if (finished) return;
       const str = chunk.toString();
-
-      if (!firstChunk) {
-        firstChunk = chunk;
-        const trimmed = str.trim();
-        if (trimmed.startsWith("{") && (trimmed.includes("FreeUsageLimitError") || trimmed.includes("FreeTierError") || trimmed.includes('"error"'))) {
+      buffer += str;
+      if (!firstChunkHandled) {
+        const det = detectUpstreamError(buffer);
+        if (det.needMore) return;
+        firstChunkHandled = true;
+        firstChunk = Buffer.from(buffer);
+        if (!det.isStream && det.parsed) {
+          const fb = zenRes.statusCode === 200 ? 429 : zenRes.statusCode;
+          const mapped = mapZenError(fb, det.parsed, "openai");
+          finished = true;
           try {
-            const parsed = JSON.parse(trimmed);
-            if (parsed.error || parsed.type === "error") {
-              const mapped = mapZenError(zenRes.statusCode === 200 ? 429 : zenRes.statusCode, parsed, "openai");
-              if (!res.headersSent) {
-                res.status(mapped.status).json(mapped.body);
-              }
-              zenRes.resume();
-              return;
-            }
+            zenRes.resume();
           } catch {}
+          try {
+            req.destroy();
+          } catch {}
+          if (!res.headersSent && !res.writableEnded) {
+            res.status(mapped.status).json(mapped.body);
+          } else if (!res.writableEnded) {
+            try {
+              res.end();
+            } catch {}
+          }
+          return;
         }
+      } else if (!firstChunk) {
+        firstChunk = chunk;
       }
 
       sendHeaders();
-      buffer += str;
+      if (finished || res.writableEnded) return;
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
 
       for (const line of lines) {
+        if (finished || res.writableEnded) break;
         if (!line.startsWith("data: ")) {
           res.write(line + "\n");
           continue;
@@ -1376,29 +1870,78 @@ function pipeZenResponse(zenOpts, body, stream, res) {
     });
 
     zenRes.on("end", () => {
+      if (finished) return;
       if (!headersSent && !firstChunk) {
-        if (!res.headersSent) {
+        finished = true;
+        if (!res.headersSent && !res.writableEnded) {
           const mapped = mapZenError(502, { message: "Empty response from upstream" }, "openai");
           res.status(mapped.status).json(mapped.body);
+        } else if (!res.writableEnded) {
+          try {
+            res.end();
+          } catch {}
         }
         return;
       }
-      if (headersSent) res.end();
+      if (headersSent && !finished && !res.writableEnded) {
+        finished = true;
+        res.end();
+      }
+    });
+
+    zenRes.on("error", (e) => {
+      if (finished) return;
+      try {
+        req.destroy();
+      } catch {}
+      if (!headersSent && !res.headersSent) {
+        finished = true;
+        const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
+        res.status(mapped.status).json(mapped.body);
+      } else if (!finished && !res.writableEnded) {
+        finished = true;
+        try {
+          res.end();
+        } catch {}
+      }
     });
   });
 
   req.on("error", (e) => {
-    if (!res.headersSent) {
-      const mapped = mapZenError(502, { message: e.message }, "openai");
+    if (finished || res.writableEnded) return;
+    if (!res.headersSent && !headersSent) {
+      finished = true;
+      const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
       res.status(mapped.status).json(mapped.body);
+    } else if (!finished && res.writableEnded === false) {
+      finished = true;
+      try {
+        res.end();
+      } catch {}
     }
   });
 
   req.on("timeout", () => {
     req.destroy();
-    if (!res.headersSent) {
+    if (finished || res.writableEnded) return;
+    if (!res.headersSent && !headersSent) {
+      finished = true;
       const mapped = mapZenError(504, { message: "Upstream timeout" }, "openai");
       res.status(mapped.status).json(mapped.body);
+    } else if (!finished) {
+      finished = true;
+      try {
+        res.end();
+      } catch {}
+    }
+  });
+
+  res.on("close", () => {
+    if (!finished) {
+      finished = true;
+      try {
+        req.destroy();
+      } catch {}
     }
   });
 
@@ -1410,6 +1953,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
   res.setHeader("x-zen-served-by", "ocodeproxy");
   const msgId = ocId("msg");
 
+  applyUpstreamProxy(zenOpts);
   const req = https.request(zenOpts, (zenRes) => {
     let headersSent = false;
     let buffer = "";
@@ -1417,14 +1961,40 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
     let contentIdx = 0;
     let toolIdx = -1;
     let firstChunkHandled = false;
+    let finished = false;
+    let stopSent = false;
 
     function sendSSE(event, data) {
+      if (finished || stopSent || res.writableEnded) return;
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
       if (res.flush) res.flush();
     }
 
+    function sendStopOnce(stopReason) {
+      if (stopSent || res.writableEnded) return;
+      stopSent = true;
+      try {
+        const totalBlocks = (contentIdx > 0 ? 1 : 0) + (toolIdx >= 0 ? toolIdx + 1 : 0);
+        for (let i = 0; i < totalBlocks; i++) {
+          res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: i })}\n\n`);
+        }
+        res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: outputTokens } })}\n\n`);
+        res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
+        if (res.flush) res.flush();
+      } catch {}
+    }
+
+    function endAnthropicStream(stopReason) {
+      if (finished) return;
+      sendStopOnce(stopReason);
+      finished = true;
+      try {
+        if (!res.writableEnded) res.end();
+      } catch {}
+    }
+
     function sendHeaders() {
-      if (headersSent) return;
+      if (headersSent || finished) return;
       headersSent = true;
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -1445,27 +2015,34 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
     }
 
     zenRes.on("data", (chunk) => {
+      if (finished) return;
       const str = chunk.toString();
-
+      buffer += str;
       if (!firstChunkHandled) {
+        const det = detectUpstreamError(buffer);
+        if (det.needMore) return;
         firstChunkHandled = true;
-        const trimmed = str.trim();
-        if (trimmed.startsWith("{") && (trimmed.includes("FreeUsageLimitError") || trimmed.includes('"error"'))) {
+        if (!det.isStream && det.parsed) {
+          const fb = zenRes.statusCode === 200 ? 429 : zenRes.statusCode;
+          const mapped = mapZenError(fb, det.parsed, "anthropic");
+          finished = true;
           try {
-            const parsed = JSON.parse(trimmed);
-            if (parsed.error || parsed.type === "error") {
-              const mapped = mapZenError(zenRes.statusCode === 200 ? 429 : zenRes.statusCode, parsed, "anthropic");
-              if (!res.headersSent) {
-                res.status(mapped.status).json(mapped.body);
-              }
-              zenRes.resume();
-              return;
-            }
+            zenRes.resume();
           } catch {}
+          try {
+            req.destroy();
+          } catch {}
+          if (!res.headersSent && !res.writableEnded) {
+            res.status(mapped.status).json(mapped.body);
+          } else if (!res.writableEnded) {
+            try {
+              res.end();
+            } catch {}
+          }
+          return;
         }
       }
 
-      buffer += str;
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
 
@@ -1525,49 +2102,84 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens) {
 
         if (parsed.choices?.[0]?.finish_reason) {
           const fr = parsed.choices[0].finish_reason;
-          const totalBlocks = (contentIdx > 0 ? 1 : 0) + (toolIdx >= 0 ? toolIdx + 1 : 0);
-          for (let i = 0; i < totalBlocks; i++) {
-            sendSSE("content_block_stop", { type: "content_block_stop", index: i });
-          }
-
           let stopReason = "end_turn";
           if (fr === "tool_calls") stopReason = "tool_use";
           else if (fr === "length") stopReason = "max_tokens";
-
-          sendSSE("message_delta", {
-            type: "message_delta",
-            delta: { stop_reason: stopReason },
-            usage: { output_tokens: outputTokens },
-          });
-          sendSSE("message_stop", { type: "message_stop" });
+          sendStopOnce(stopReason);
         }
       }
     });
 
     zenRes.on("end", () => {
+      if (finished) return;
       if (!headersSent) {
-        if (!res.headersSent) {
+        finished = true;
+        if (!res.headersSent && !res.writableEnded) {
           const mapped = mapZenError(502, { message: "Empty response from upstream" }, "anthropic");
           res.status(mapped.status).json(mapped.body);
+        } else if (!res.writableEnded) {
+          try {
+            res.end();
+          } catch {}
         }
         return;
       }
-      res.end();
+      if (!stopSent) sendStopOnce(toolIdx >= 0 ? "tool_use" : "end_turn");
+      if (!finished && !res.writableEnded) {
+        finished = true;
+        try {
+          res.end();
+        } catch {}
+      }
+    });
+
+    zenRes.on("error", (e) => {
+      if (finished) return;
+      try {
+        req.destroy();
+      } catch {}
+      if (!headersSent && !res.headersSent) {
+        finished = true;
+        const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "anthropic");
+        res.status(mapped.status).json(mapped.body);
+      } else if (!finished) {
+        endAnthropicStream("end_turn");
+      }
     });
   });
 
   req.on("error", (e) => {
-    if (!res.headersSent) {
-      const mapped = mapZenError(502, { message: e.message }, "anthropic");
+    if (finished || res.writableEnded) return;
+    try {
+      req.destroy();
+    } catch {}
+    if (!res.headersSent && !headersSent) {
+      finished = true;
+      const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "anthropic");
       res.status(mapped.status).json(mapped.body);
+    } else if (!finished) {
+      endAnthropicStream("end_turn");
     }
   });
 
   req.on("timeout", () => {
     req.destroy();
-    if (!res.headersSent) {
+    if (finished || res.writableEnded) return;
+    if (!res.headersSent && !headersSent) {
+      finished = true;
       const mapped = mapZenError(504, { message: "Upstream timeout" }, "anthropic");
       res.status(mapped.status).json(mapped.body);
+    } else if (!finished) {
+      endAnthropicStream("end_turn");
+    }
+  });
+
+  res.on("close", () => {
+    if (!finished) {
+      finished = true;
+      try {
+        req.destroy();
+      } catch {}
     }
   });
 
@@ -1582,9 +2194,7 @@ app.get("/v1/models", async (req, res) => {
     return res.status(mapped.status).json(mapped.body);
   }
 
-  if (Date.now() - lastModelsFetchTime > 5 * 60 * 1000) {
-    await refreshModels(true).catch(() => {});
-  }
+  await maybeRefreshModels();
 
   res.setHeader("x-zen-served-by", "ocodeproxy");
   res.json({
@@ -1598,16 +2208,35 @@ app.get("/v1/models", async (req, res) => {
   });
 });
 
-app.get("/v1/models/:id", (req, res) => {
+app.get("/v1/models/:id", async (req, res) => {
   const user = auth(req);
   if (!user) {
     const mapped = mapZenError(401, { message: "Invalid API key" }, "openai");
     return res.status(mapped.status).json(mapped.body);
   }
 
-  const id = req.params.id;
-  if (!id) {
-    return res.status(404).json({ error: { message: "Model not found", type: "not_found_error" } });
+  const rawId = req.params.id;
+  if (typeof rawId !== "string" || !rawId.trim()) {
+    return res.status(404).json({
+      error: { message: "Model not found", type: "not_found_error", code: "model_not_found" },
+    });
+  }
+  const id = resolveModel(rawId.trim());
+
+  if (isDeprecatedModel(id)) {
+    return res.status(404).json({
+      error: { message: `Model '${id}' is discontinued and no longer supported.`, type: "not_found_error", code: "model_deprecated" },
+    });
+  }
+
+  if (!isKnownModel(id)) {
+    await maybeRefreshModels();
+  }
+
+  if (!isKnownModel(id)) {
+    return res.status(404).json({
+      error: { message: `Model '${id}' not found.`, type: "not_found_error", code: "model_not_found" },
+    });
   }
 
   res.setHeader("x-zen-served-by", "ocodeproxy");
@@ -1626,46 +2255,56 @@ app.post("/v1/chat/completions", async (req, res) => {
     return res.status(mapped.status).json(mapped.body);
   }
 
-  const { model, messages, stream, tools, tool_choice } = req.body;
-
-  if (isDeprecatedModel(model)) {
+  const reqBody = req.body && typeof req.body === "object" ? req.body : {};
+  const { model, messages, stream, tools, tool_choice } = reqBody;
+  if (typeof model !== "string" || !model.trim()) {
     return res.status(400).json({
-      error: { message: `Model '${model}' is discontinued and no longer supported.`, type: "invalid_request_error", code: "model_deprecated" },
+      error: { message: "Missing required field: model (string)", type: "invalid_request_error", code: "missing_model" },
+    });
+  }
+  if (!Array.isArray(messages)) {
+    return res.status(400).json({
+      error: { message: "Missing required field: messages (array)", type: "invalid_request_error", code: "missing_messages" },
     });
   }
 
-  if (!isKnownModel(model)) {
-    await refreshModels(true).catch(() => {});
+  const targetModel = resolveModel(model.trim());
+
+  if (isDeprecatedModel(targetModel)) {
+    return res.status(400).json({
+      error: { message: `Model '${targetModel}' is discontinued and no longer supported.`, type: "invalid_request_error", code: "model_deprecated" },
+    });
   }
 
-  if (!isKnownModel(model)) {
-    return res.status(400).json({
-      error: { message: `Unknown model: ${model}. Available: ${ALL_MODELS.join(", ")}`, type: "invalid_request_error" },
+  if (!isKnownModel(targetModel)) {
+    await maybeRefreshModels();
+  }
+
+  if (!isKnownModel(targetModel)) {
+    return res.status(404).json({
+      error: { message: `Model '${targetModel}' not found.`, type: "not_found_error", code: "model_not_found" },
     });
   }
 
   res.setHeader("x-zen-served-by", "ocodeproxy");
   const sessionId = getSession(user);
-  const targetModel = resolveModel(model);
 
-  if (isResponsesModel(model)) {
+  if (isResponsesModel(targetModel)) {
     if (stream) {
       const { body, options } = zenResponsesRequest(targetModel, messages, true, tools, tool_choice, sessionId);
-      pipeZenResponses(options, body, model, res);
+      pipeZenResponses(options, body, targetModel, res);
     } else {
       try {
-        const zenResp = await executeWithRetry(async () => {
-          const { body, options } = zenResponsesRequest(targetModel, messages, true, tools, tool_choice, sessionId);
-          return collectZenSse(options, body);
-        }, 1);
+        const { body, options } = zenResponsesRequest(targetModel, messages, true, tools, tool_choice, sessionId);
+        const zenResp = await executeWithRetry(() => collectZenSse(options, body), 1);
 
         if (zenResp.error || zenResp.status >= 400) {
           const mapped = mapZenError(zenResp.status, zenResp.error, "openai");
           return res.status(mapped.status).json(mapped.body);
         }
-        res.json(aggregateResponsesSseToOpenAI(zenResp.raw, model));
+        res.json(aggregateResponsesSseToOpenAI(zenResp.raw, targetModel));
       } catch (e) {
-        const mapped = mapZenError(502, { message: e.message }, "openai");
+        const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
         res.status(mapped.status).json(mapped.body);
       }
     }
@@ -1677,18 +2316,16 @@ app.post("/v1/chat/completions", async (req, res) => {
     pipeZenResponse(options, body, true, res);
   } else {
     try {
-      const zenResp = await executeWithRetry(async () => {
-        const { body, options } = zenRequest(targetModel, messages, true, tools, tool_choice, sessionId);
-        return collectZenSse(options, body);
-      }, 1);
+      const { body, options } = zenRequest(targetModel, messages, true, tools, tool_choice, sessionId);
+      const zenResp = await executeWithRetry(() => collectZenSse(options, body), 1);
 
       if (zenResp.error || zenResp.status >= 400) {
         const mapped = mapZenError(zenResp.status, zenResp.error, "openai");
         return res.status(mapped.status).json(mapped.body);
       }
-      res.json(aggregateSseToCompletion(zenResp.raw, model));
+      res.json(aggregateSseToCompletion(zenResp.raw, targetModel));
     } catch (e) {
-      const mapped = mapZenError(502, { message: e.message }, "openai");
+      const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
       res.status(mapped.status).json(mapped.body);
     }
   }
@@ -1701,50 +2338,62 @@ app.post("/v1/messages", async (req, res) => {
     return res.status(mapped.status).json(mapped.body);
   }
 
-  const { model, stream } = req.body;
-
-  if (isDeprecatedModel(model)) {
+  const reqBody = req.body && typeof req.body === "object" ? req.body : {};
+  const { model, stream } = reqBody;
+  if (typeof model !== "string" || !model.trim()) {
     return res.status(400).json({
       type: "error",
-      error: { type: "invalid_request_error", message: `Model '${model}' is discontinued and no longer supported.` },
+      error: { type: "invalid_request_error", message: "Missing required field: model (string)" },
+    });
+  }
+  if (!Array.isArray(reqBody.messages)) {
+    return res.status(400).json({
+      type: "error",
+      error: { type: "invalid_request_error", message: "Missing required field: messages (array)" },
     });
   }
 
-  if (!isKnownModel(model)) {
-    await refreshModels(true).catch(() => {});
-  }
+  const targetModel = resolveModel(model.trim());
 
-  if (!isKnownModel(model)) {
+  if (isDeprecatedModel(targetModel)) {
     return res.status(400).json({
       type: "error",
-      error: { type: "invalid_request_error", message: `Unknown model: ${model}. Available: ${ALL_MODELS.join(", ")}` },
+      error: { type: "invalid_request_error", message: `Model '${targetModel}' is discontinued and no longer supported.` },
+    });
+  }
+
+  if (!isKnownModel(targetModel)) {
+    await maybeRefreshModels();
+  }
+
+  if (!isKnownModel(targetModel)) {
+    return res.status(404).json({
+      type: "error",
+      error: { type: "not_found_error", message: `Model '${targetModel}' not found.` },
     });
   }
 
   res.setHeader("x-zen-served-by", "ocodeproxy");
   const sessionId = getSession(user);
-  const { messages, tools } = anthropicToOpenAI(req.body);
-  const inputTokens = Math.ceil(JSON.stringify(messages).length / 4);
-  const targetModel = resolveModel(model);
+  const { messages, tools } = anthropicToOpenAI(reqBody);
+  const inputTokens = 0;
 
-  if (isResponsesModel(model)) {
+  if (isResponsesModel(targetModel)) {
     if (stream) {
       const { body, options } = zenResponsesRequest(targetModel, messages, true, tools, undefined, sessionId);
-      pipeZenResponsesAsAnthropic(options, body, model, res, inputTokens);
+      pipeZenResponsesAsAnthropic(options, body, targetModel, res, inputTokens);
     } else {
       try {
-        const zenResp = await executeWithRetry(async () => {
-          const { body, options } = zenResponsesRequest(targetModel, messages, true, tools, undefined, sessionId);
-          return collectZenSse(options, body);
-        }, 1);
+        const { body, options } = zenResponsesRequest(targetModel, messages, true, tools, undefined, sessionId);
+        const zenResp = await executeWithRetry(() => collectZenSse(options, body), 1);
 
         if (zenResp.error || zenResp.status >= 400) {
           const mapped = mapZenError(zenResp.status, zenResp.error, "anthropic");
           return res.status(mapped.status).json(mapped.body);
         }
-        res.json(openAIToAnthropic(aggregateResponsesSseToOpenAI(zenResp.raw, model), model, inputTokens));
+        res.json(openAIToAnthropic(aggregateResponsesSseToOpenAI(zenResp.raw, targetModel), targetModel, inputTokens));
       } catch (e) {
-        const mapped = mapZenError(502, { message: e.message }, "anthropic");
+        const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "anthropic");
         res.status(mapped.status).json(mapped.body);
       }
     }
@@ -1753,21 +2402,19 @@ app.post("/v1/messages", async (req, res) => {
 
   if (stream) {
     const { body, options } = zenRequest(targetModel, messages, true, tools, undefined, sessionId);
-    pipeZenAsAnthropic(options, body, model, res, inputTokens);
+    pipeZenAsAnthropic(options, body, targetModel, res, inputTokens);
   } else {
     try {
-      const zenResp = await executeWithRetry(async () => {
-        const { body, options } = zenRequest(targetModel, messages, true, tools, undefined, sessionId);
-        return collectZenSse(options, body);
-      }, 1);
+      const { body, options } = zenRequest(targetModel, messages, true, tools, undefined, sessionId);
+      const zenResp = await executeWithRetry(() => collectZenSse(options, body), 1);
 
       if (zenResp.error || zenResp.status >= 400) {
         const mapped = mapZenError(zenResp.status, zenResp.error, "anthropic");
         return res.status(mapped.status).json(mapped.body);
       }
-      res.json(openAIToAnthropic(aggregateSseToCompletion(zenResp.raw, model), model, inputTokens));
+      res.json(openAIToAnthropic(aggregateSseToCompletion(zenResp.raw, targetModel), targetModel, inputTokens));
     } catch (e) {
-      const mapped = mapZenError(502, { message: e.message }, "anthropic");
+      const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "anthropic");
       res.status(mapped.status).json(mapped.body);
     }
   }
@@ -1781,9 +2428,8 @@ app.get("/health", (_req, res) => {
     port: currentPort,
     models: ALL_MODELS.length,
     ocVersion: ocVersion,
-    ua: `opencode/${ocVersion} ai-sdk/provider-utils/${AI_SDK_VER} runtime/bun/${BUN_VER}`,
     zenAuthMode: ZEN_AUTH_MODE,
-    upstreamProxy: upstreamProxyUrl || null,
+    upstreamProxyConfigured: Boolean(upstreamProxyUrl),
     endpoints: [
       "/health",
       "/v1/models",
@@ -1810,7 +2456,32 @@ app.get("/", (_req, res) => {
   });
 });
 
+app.use((err, req, res, _next) => {
+  if (res.headersSent || res.writableEnded) return;
+  const isAnthropic = typeof req.path === "string" && req.path.startsWith("/v1/messages");
+  if (err?.type === "entity.too.large") {
+    if (isAnthropic) {
+      return res.status(413).json({ type: "error", error: { type: "invalid_request_error", message: "Request body too large" } });
+    }
+    return res.status(413).json({ error: { message: "Request body too large", type: "invalid_request_error", code: "body_too_large" } });
+  }
+  if (err?.type === "entity.parse.failed" || err instanceof SyntaxError) {
+    if (isAnthropic) {
+      return res.status(400).json({ type: "error", error: { type: "invalid_request_error", message: "Invalid JSON body" } });
+    }
+    return res.status(400).json({ error: { message: "Invalid JSON body", type: "invalid_request_error", code: "invalid_json" } });
+  }
+  if (isAnthropic) {
+    return res.status(500).json({ type: "error", error: { type: "api_error", message: "Internal server error" } });
+  }
+  res.status(500).json({ error: { message: "Internal server error", type: "api_error", code: "internal_server_error" } });
+});
+
 function renderBanner(port) {
+  if (!process.stdout.isTTY) {
+    console.error(`OCodeProxy listening on http://0.0.0.0:${port}`);
+    return;
+  }
   const localUrl = `http://localhost:${port}`;
   const networkUrl = `http://0.0.0.0:${port}`;
 
@@ -1848,21 +2519,60 @@ function renderBanner(port) {
   );
 }
 
-function startServer(port) {
+function startServer(port, opts = {}) {
+  const { fatal = true } = opts;
+  let settled = false;
+  let readyResolve;
+  const ready = new Promise((resolve) => { readyResolve = resolve; });
   const srv = app.listen(port, "0.0.0.0", () => {
+    settled = true;
     renderBanner(port);
+    readyResolve(true);
   });
 
   srv.on("error", (err) => {
     if (err.code === "EADDRINUSE") {
       console.error(pc.red(`\n✖ Error: port ${port} is already in use.\n`));
-      if (!isKeyListening && !process.stdin.isTTY) process.exit(1);
+      if (!settled) {
+        settled = true;
+        readyResolve(false);
+      }
+      if (fatal) {
+        pauseKeybindings();
+        process.exit(1);
+      }
     } else {
-      console.error(err);
+      console.error(pc.red(`Failed to bind port ${port}: ${err?.message || err}`));
+      if (!settled) {
+        settled = true;
+        readyResolve(false);
+      }
     }
   });
 
+  srv.ready = ready;
   return srv;
+}
+
+function closeServer(srv, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    if (!srv) return resolve();
+    let done = false;
+    const finish = () => {
+      if (!done) {
+        done = true;
+        resolve();
+      }
+    };
+    srv.close(finish);
+    setTimeout(() => {
+      try {
+        srv.closeAllConnections?.();
+      } catch {}
+      finish();
+    }, timeoutMs);
+    srv.once?.("close", finish);
+  });
 }
 
 let isKeyListening = false;
@@ -1890,6 +2600,10 @@ function pauseKeybindings() {
 }
 
 async function hotSwap() {
+  if (!process.stdin.isTTY) {
+    p.log.error("Port hot-swap requires an interactive terminal.");
+    return;
+  }
   p.intro(pc.bgCyan(pc.black(" ⚙️ OCodeProxy Port Hot-Swap ")));
   const newPort = await promptPortSelection(currentPort);
 
@@ -1909,20 +2623,47 @@ async function hotSwap() {
   }
 
   const s = p.spinner();
-  s.start(`Stopping server on port ${currentPort}...`);
+  s.start(`Starting server on port ${newPort}...`);
 
-  await new Promise((resolve) => currentServer.close(resolve));
+  const next = startServer(newPort, { fatal: false });
+  const started = await next.ready;
+  if (!started) {
+    s.stop(pc.red(`✖ Could not bind port ${newPort}, staying on port ${currentPort}.`));
+    try {
+      await closeServer(next, 5000);
+    } catch {}
+    return;
+  }
 
-  s.message(`Starting server on port ${newPort}...`);
+  s.message(`Stopping server on port ${currentPort}...`);
+  const old = currentServer;
   currentPort = newPort;
-  currentServer = startServer(currentPort);
+  currentServer = next;
+  await closeServer(old, 5000);
 
   s.stop(pc.green(`✔ Server switched to port ${newPort}!`));
 }
 
 async function openSettings() {
+  if (!process.stdin.isTTY) {
+    console.error("Settings require an interactive terminal.");
+    return;
+  }
   pauseKeybindings();
+  try {
+    await openSettingsMenu();
+  } catch (err) {
+    console.error(pc.red(`Settings error: ${err?.message || err}`));
+  } finally {
+    if (process.stdout.isTTY) {
+      console.clear();
+      renderBanner(currentPort);
+    }
+    setupKeybindings();
+  }
+}
 
+async function openSettingsMenu() {
   p.intro(pc.bgCyan(pc.black(" ⚙️ OCodeProxy Settings ")));
 
   let inSettings = true;
@@ -1990,7 +2731,9 @@ async function openSettings() {
       const res = await updateOcVersion(true);
       if (res.updated) {
         s.stop(pc.green(`✔ OpenCode UA version updated: ${res.prev} → ${pc.bold(res.version)}!`));
-      } else if (res.latest && res.latest === ocVersion) {
+      } else if (!res.latest) {
+        s.stop(pc.yellow(`⚠ Could not fetch latest release. Kept current version (${ocVersion}).`));
+      } else if (res.latest === ocVersion) {
         s.stop(pc.cyan(`ℹ OpenCode UA version is already up to date (${pc.bold(ocVersion)}).`));
       } else {
         s.stop(pc.yellow(`⚠ Could not fetch latest release. Kept current version (${ocVersion}).`));
@@ -2029,55 +2772,80 @@ async function openSettings() {
       }
     } else if (action === "regenerate_keys") {
       const confirm = await p.confirm({
-        message: "Are you sure you want to regenerate default keys? Existing keys will be replaced.",
+        message: "Regenerate default keys? Only admin & user-default are reset, custom keys are kept.",
         initialValue: false,
       });
 
       if (!p.isCancel(confirm) && confirm) {
         apiKeys = {
+          ...apiKeys,
           admin: generateKeyString(),
           "user-default": generateKeyString(),
         };
         saveKeys();
         p.log.success(pc.green("✔ Default keys regenerated successfully:"));
         for (const [name, key] of Object.entries(apiKeys)) {
-          p.log.message(`  ${pc.bold(name.padEnd(14))} ${pc.dim(key)}`);
+          p.log.message(`  ${pc.bold(name.padEnd(14))} ${pc.dim(maskKey(key))}`);
         }
       }
     } else if (action === "list_keys") {
       p.log.info(pc.cyan(`Active API keys (${KEYS_FILE}):`));
       for (const [name, key] of Object.entries(apiKeys)) {
-        p.log.message(`  ${pc.bold(name.padEnd(14))} ${pc.dim(key)}`);
+        p.log.message(`  ${pc.bold(name.padEnd(14))} ${pc.dim(maskKey(key))}`);
       }
     }
   }
 
-  if (process.stdout.isTTY) {
-    console.clear();
-    renderBanner(currentPort);
-  }
-  setupKeybindings();
 }
+
+let settingsOpen = false;
 
 async function onKeypress(str, key) {
-  if (!key) return;
+  if (!key || settingsOpen) return;
 
   if ((key.ctrl && key.name === "c") || key.name === "q") {
-    pauseKeybindings();
-    console.log(pc.dim("\nStopping server..."));
-    if (currentServer) {
-      currentServer.close(() => process.exit(0));
-    } else {
-      process.exit(0);
-    }
+    gracefulShutdown("keypress");
   } else if (key.name === "s" || key.name === "p") {
-    await openSettings();
+    settingsOpen = true;
+    try {
+      await openSettings();
+    } catch (err) {
+      console.error(pc.red(`Settings error: ${err?.message || err}`));
+    } finally {
+      settingsOpen = false;
+    }
   }
 }
+
+let isShuttingDown = false;
+function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  pauseKeybindings();
+  console.log(pc.dim(`\nReceived ${signal}, stopping server...`));
+  if (currentServer) {
+    currentServer.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5000).unref();
+  } else {
+    process.exit(0);
+  }
+}
+
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("uncaughtException", (err) => {
+  console.error(pc.red(`Uncaught exception: ${err?.stack || err?.message || err}`));
+  gracefulShutdown("uncaughtException");
+});
+process.on("unhandledRejection", (reason) => {
+  console.error(pc.red(`Unhandled rejection: ${reason?.stack || reason?.message || reason}`));
+  gracefulShutdown("unhandledRejection");
+});
 
 currentServer = startServer(currentPort);
 setupKeybindings();
 
 updateOcVersion(true).catch(() => {});
 refreshModels(true).catch(() => {});
-setInterval(checkPeriodicOcVersion, 60 * 60 * 1000);
+const ocVersionTimer = setInterval(checkPeriodicOcVersion, 60 * 60 * 1000);
+if (typeof ocVersionTimer.unref === "function") ocVersionTimer.unref();
