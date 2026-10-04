@@ -5,7 +5,11 @@ import {
   DEFAULT_RESPONSES_MODELS,
   MODEL_ALIASES,
   DISCONTINUED_MODELS,
+  CLAUDE_DISCOVERY_ALIASES,
   resolveModel,
+  resolveGatewayModel,
+  buildDiscoveryList,
+  isClaudeGatewayId,
   isModelDeprecated,
   isModelKnown,
   isModelResponses,
@@ -112,5 +116,59 @@ describe("model catalog sanity", () => {
       assert.equal(DISCONTINUED_MODELS.has(id), false);
     }
     assert.ok(Object.keys(MODEL_ALIASES).length > 0);
+  });
+});
+
+describe("isClaudeGatewayId", () => {
+  it("matches claude/anthropic ids case-insensitively", () => {
+    assert.equal(isClaudeGatewayId("claude-sonnet-4-5"), true);
+    assert.equal(isClaudeGatewayId("Claude-Opus-4-8"), true);
+    assert.equal(isClaudeGatewayId("bedrock/anthropic.claude-sonnet-4-5"), true);
+    assert.equal(isClaudeGatewayId("vertex_ai/claude-sonnet-4-6"), true);
+    assert.equal(isClaudeGatewayId("big-pickle"), false);
+    assert.equal(isClaudeGatewayId("mimo-v2.6-flash-free"), false);
+    assert.equal(isClaudeGatewayId(null), false);
+    assert.equal(isClaudeGatewayId(""), false);
+  });
+});
+
+describe("resolveGatewayModel", () => {
+  const all = ["big-pickle", "mimo-v2.6-flash-free", "muse-spark-1.3-contributor-free"];
+  it("resolves known ids and aliases normally", () => {
+    assert.equal(resolveGatewayModel("big-pickle", all, "big-pickle"), "big-pickle");
+    assert.equal(resolveGatewayModel("muse-spark-1.3-free", all, "big-pickle"), "muse-spark-1.3-contributor-free");
+  });
+  it("maps unknown claude ids to the fallback model", () => {
+    assert.equal(resolveGatewayModel("claude-sonnet-4-5", all, "big-pickle"), "big-pickle");
+    assert.equal(resolveGatewayModel("claude-opus-4-8", all, "mimo-v2.6-flash-free"), "mimo-v2.6-flash-free");
+  });
+  it("maps provider-prefixed and gateway-alias ids to fallback", () => {
+    assert.equal(resolveGatewayModel("bedrock/anthropic.claude-sonnet-4-5", all, "big-pickle"), "big-pickle");
+    assert.equal(resolveGatewayModel("vertex_ai/claude-sonnet-4-6", all, "big-pickle"), "big-pickle");
+    assert.equal(resolveGatewayModel("my-gateway-claude-sonnet", all, "big-pickle"), "big-pickle");
+  });
+  it("passes unknown non-claude ids through unresolved", () => {
+    assert.equal(resolveGatewayModel("gpt-99", all, "big-pickle"), "gpt-99");
+    assert.equal(resolveGatewayModel("gpt-99", [], "big-pickle"), "gpt-99");
+  });
+});
+
+describe("buildDiscoveryList", () => {
+  it("keeps real ids and appends claude aliases deduped", () => {
+    const list = buildDiscoveryList(["big-pickle"]);
+    assert.ok(list.includes("big-pickle"));
+    for (const alias of CLAUDE_DISCOVERY_ALIASES) {
+      assert.ok(list.includes(alias));
+      assert.equal(list.filter((id) => id === alias).length, 1);
+    }
+  });
+  it("does not duplicate aliases already present", () => {
+    const list = buildDiscoveryList(["big-pickle", "claude-sonnet-4-5"]);
+    assert.equal(list.filter((id) => id === "claude-sonnet-4-5").length, 1);
+  });
+  it("passes the Claude Code discovery filter", () => {
+    const list = buildDiscoveryList(["big-pickle", "mimo-v2.6-flash-free"]);
+    const kept = list.filter(isClaudeGatewayId);
+    assert.ok(kept.length >= CLAUDE_DISCOVERY_ALIASES.length);
   });
 });

@@ -20,6 +20,11 @@ import {
   aggregateResponsesSseToOpenAI,
   anthropicToOpenAI,
   openAIToAnthropic,
+  isAttributionText,
+  stripAttributionBlocks,
+  validateAnthropicMessagesBody,
+  anthropicParamsToChat,
+  createAnthropicBlockTracker,
 } from "../lib/convert.mjs";
 
 describe("openAIContentToResponsesText", () => {
@@ -362,5 +367,201 @@ describe("openAIToAnthropic", () => {
     );
     assert.equal(zero.usage.input_tokens, 0);
     assert.equal(zero.usage.output_tokens, 0);
+  });
+  it("maps stop_sequence finish reason", () => {
+    const out = openAIToAnthropic({ id: "a", choices: [{ message: { content: "x" }, finish_reason: "stop_sequence" }] }, "m", 0);
+    assert.equal(out.stop_reason, "stop_sequence");
+  });
+});
+
+describe("isAttributionText / stripAttributionBlocks", () => {
+  it("detects the Claude Code billing header", () => {
+    assert.equal(isAttributionText("x-anthropic-billing-header: cc_version=2; cch=1"), true);
+    assert.equal(isAttributionText("cc_version=2.1 cch=abc extra"), true);
+    assert.equal(isAttributionText("You are a helpful assistant."), false);
+    assert.equal(isAttributionText(""), false);
+    assert.equal(isAttributionText(null), false);
+  });
+  it("strips only the leading attribution block", () => {
+    const attr = { type: "text", text: "x-anthropic-billing-header: cc_version=1; cch=a" };
+    const real = { type: "text", text: "real instructions" };
+    assert.deepEqual(stripAttributionBlocks([attr, real]), [real]);
+    assert.deepEqual(stripAttributionBlocks([real, attr]), [real, attr]);
+    assert.deepEqual(stripAttributionBlocks([real]), [real]);
+    assert.deepEqual(stripAttributionBlocks([]), []);
+  });
+});
+
+describe("validateAnthropicMessagesBody", () => {
+  it("requires model, messages and max_tokens", () => {
+    assert.match(validateAnthropicMessagesBody({}), /model/);
+    assert.match(validateAnthropicMessagesBody({ model: "m" }), /messages/);
+    assert.match(validateAnthropicMessagesBody({ model: "m", messages: [] }), /max_tokens/);
+  });
+  it("rejects non-integer or negative max_tokens", () => {
+    assert.match(validateAnthropicMessagesBody({ model: "m", messages: [], max_tokens: -1 }), /max_tokens/);
+    assert.match(validateAnthropicMessagesBody({ model: "m", messages: [], max_tokens: 1.5 }), /max_tokens/);
+    assert.match(validateAnthropicMessagesBody({ model: "m", messages: [], max_tokens: "5" }), /max_tokens/);
+  });
+  it("accepts zero (cache pre-warm) and valid bodies", () => {
+    assert.equal(validateAnthropicMessagesBody({ model: "m", messages: [], max_tokens: 0 }), null);
+    assert.equal(validateAnthropicMessagesBody({ model: "m", messages: [{ role: "user", content: "hi" }], max_tokens: 5 }), null);
+  });
+});
+
+describe("anthropicParamsToChat effort mapping", () => {
+  it("maps output_config.effort to reasoning_effort", () => {
+    assert.deepEqual(
+      anthropicParamsToChat({ max_tokens: 5, output_config: { effort: "high" } }),
+      { max_tokens: 5, reasoning_effort: "high" }
+    );
+  });
+  it("maps adaptive/enabled thinking to medium effort", () => {
+    assert.deepEqual(
+      anthropicParamsToChat({ max_tokens: 5, thinking: { type: "adaptive" } }),
+      { max_tokens: 5, reasoning_effort: "medium" }
+    );
+    assert.deepEqual(
+      anthropicParamsToChat({ max_tokens: 5, thinking: { type: "enabled", budget_tokens: 2000 } }),
+      { max_tokens: 5, reasoning_effort: "medium" }
+    );
+  });
+  it("maps disabled/between_tools thinking to none", () => {
+    assert.deepEqual(
+      anthropicParamsToChat({ max_tokens: 5, thinking: { type: "disabled" } }),
+      { max_tokens: 5, reasoning_effort: "none" }
+    );
+    assert.deepEqual(
+      anthropicParamsToChat({ max_tokens: 5, thinking: { type: "between_tools" } }),
+      { max_tokens: 5, reasoning_effort: "none" }
+    );
+  });
+  it("keeps explicit reasoning_effort over derived values", () => {
+    assert.deepEqual(
+      anthropicParamsToChat({ max_tokens: 5, reasoning_effort: "low", output_config: { effort: "high" }, thinking: { type: "adaptive" } }),
+      { max_tokens: 5, reasoning_effort: "low" }
+    );
+  });
+});
+
+describe("anthropicToOpenAI gateway handling", () => {
+  it("strips the attribution block from system arrays", () => {
+    const out = anthropicToOpenAI({
+      system: [
+        { type: "text", text: "x-anthropic-billing-header: cc_version=2; cch=1" },
+        { type: "text", text: "sys" },
+      ],
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert.deepEqual(out.messages[0], { role: "system", content: "sys" });
+  });
+  it("drops thinking blocks instead of leaking them upstream", () => {
+    const out = anthropicToOpenAI({
+      messages: [{
+        role: "user",
+        content: [
+          { type: "thinking", thinking: "hmm", signature: "sig" },
+          { type: "redacted_thinking", data: "enc" },
+          { type: "text", text: "hi" },
+        ],
+      }],
+    });
+    assert.equal(out.messages[0].content, "hi");
+  });
+  it("renders server_tool_use as text context", () => {
+    const out = anthropicToOpenAI({
+      messages: [{
+        role: "user",
+        content: [{ type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: { q: "x" } }],
+      }],
+    });
+    assert.match(out.messages[0].content, /server_tool_use: web_search/);
+  });
+});
+
+describe("createAnthropicBlockTracker", () => {
+  // Claude Code aborts the stream as malformed when an event references a
+  // block whose content_block_start never arrived, or duplicates stops.
+  function validateSequence(events) {
+    const started = new Set();
+    const stopped = new Set();
+    for (const [event, data] of events) {
+      if (event === "content_block_start") {
+        assert.ok(!started.has(data.index), `duplicate start for index ${data.index}`);
+        started.add(data.index);
+      } else if (event === "content_block_delta") {
+        assert.ok(started.has(data.index), `delta for never-started block ${data.index}`);
+        assert.ok(!stopped.has(data.index), `delta for stopped block ${data.index}`);
+      } else if (event === "content_block_stop") {
+        assert.ok(started.has(data.index), `stop for never-started block ${data.index}`);
+        assert.ok(!stopped.has(data.index), `duplicate stop for index ${data.index}`);
+        stopped.add(data.index);
+      }
+    }
+    return { started, stopped };
+  }
+
+  function collect(fn) {
+    const events = [];
+    const blocks = createAnthropicBlockTracker((event, data) => events.push([event, data]));
+    fn(blocks);
+    return events;
+  }
+
+  it("assigns sequential indices and stops each block exactly once", () => {
+    const events = collect((blocks) => {
+      const text = blocks.start("text", { type: "text", text: "" });
+      assert.equal(text, 0);
+      const tool = blocks.start("tool:0", { type: "tool_use", id: "t1", name: "read" });
+      assert.equal(tool, 1);
+      blocks.stopAll();
+      blocks.stopAll();
+    });
+    const { started, stopped } = validateSequence(events);
+    assert.deepEqual([...started].sort(), [0, 1]);
+    assert.deepEqual([...stopped].sort(), [0, 1]);
+  });
+
+  it("is idempotent per key and ignores stops for unknown blocks", () => {
+    const events = collect((blocks) => {
+      assert.equal(blocks.start("text", { type: "text", text: "" }), 0);
+      assert.equal(blocks.start("text", { type: "text", text: "" }), 0);
+      blocks.stopKey("missing");
+      blocks.stopIndex(99);
+      assert.equal(blocks.has("text"), true);
+      assert.equal(blocks.has("missing"), false);
+      assert.equal(blocks.isOpen("text"), true);
+      blocks.stopKey("text");
+      assert.equal(blocks.isOpen("text"), false);
+      assert.equal(blocks.startedCount(), 1);
+    });
+    validateSequence(events);
+    assert.equal(events.filter(([e]) => e === "content_block_start").length, 1);
+    assert.equal(events.filter(([e]) => e === "content_block_stop").length, 1);
+  });
+
+  it("keeps a think-text-tool flow gapless (the malformed-stream regression)", () => {
+    const events = collect((blocks) => {
+      blocks.start("think", { type: "thinking", thinking: "" });
+      blocks.stopKey("think");
+      const text = blocks.start("text", { type: "text", text: "" });
+      assert.equal(text, 1);
+      const tool = blocks.start("tool:0", { type: "tool_use", id: "t1", name: "read" });
+      assert.equal(tool, 2);
+      blocks.stopAll();
+    });
+    const { started, stopped } = validateSequence(events);
+    assert.deepEqual([...started].sort(), [0, 1, 2]);
+    assert.deepEqual([...stopped].sort(), [0, 1, 2]);
+  });
+
+  it("keeps text-tool-text flows valid without early stops", () => {
+    const events = collect((blocks) => {
+      const text = blocks.start("text", { type: "text", text: "" });
+      blocks.start("tool:0", { type: "tool_use", id: "t1", name: "read" });
+      assert.equal(blocks.keyIndex("text"), text);
+      blocks.stopAll();
+    });
+    validateSequence(events);
   });
 });

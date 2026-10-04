@@ -29,12 +29,16 @@ import {
   chatParamsToResponsesParams,
   anthropicToOpenAI,
   openAIToAnthropic,
+  validateAnthropicMessagesBody,
+  createAnthropicBlockTracker,
 } from "./lib/convert.mjs";
 import {
   DEFAULT_CHAT_MODELS,
   DEFAULT_RESPONSES_MODELS,
   DISCONTINUED_MODELS,
-  resolveModel,
+  resolveGatewayModel,
+  buildDiscoveryList,
+  isClaudeGatewayId,
   isModelDeprecated,
   isModelKnown,
   isModelResponses,
@@ -48,6 +52,7 @@ import {
   publicNetworkMessage,
   detectUpstreamError,
   isRetryableUpstreamStatus,
+  gatewayRetryHeaders,
 } from "./lib/errors.mjs";
 import { collectWithFallback, tryStreamFallback } from "./lib/fallback.mjs";
 
@@ -336,15 +341,24 @@ function loadKeys() {
 loadKeys();
 
 function auth(req) {
-  const raw = req.headers.authorization ?? req.headers["x-api-key"] ?? "";
-  const hdr = Array.isArray(raw) ? raw[0] ?? "" : raw;
-  if (typeof hdr !== "string") return null;
-  const tok = hdr.startsWith("Bearer ") ? hdr.slice(7) : hdr;
-  const tokBuf = Buffer.from(tok);
-  for (const [name, key] of Object.entries(apiKeys)) {
-    if (typeof key !== "string" || !key) continue;
-    const keyBuf = Buffer.from(key);
-    if (tokBuf.length === keyBuf.length && crypto.timingSafeEqual(tokBuf, keyBuf)) return name;
+  // Claude Code >=2.1.248 sends both credential headers; try every value.
+  const candidates = [];
+  for (const raw of [req.headers.authorization, req.headers["x-api-key"]]) {
+    if (Array.isArray(raw)) {
+      for (const v of raw) if (typeof v === "string" && v) candidates.push(v);
+    } else if (typeof raw === "string" && raw) {
+      candidates.push(raw);
+    }
+  }
+  for (const hdr of candidates) {
+    const tok = hdr.startsWith("Bearer ") ? hdr.slice(7) : hdr;
+    if (!tok) continue;
+    const tokBuf = Buffer.from(tok);
+    for (const [name, key] of Object.entries(apiKeys)) {
+      if (typeof key !== "string" || !key) continue;
+      const keyBuf = Buffer.from(key);
+      if (tokBuf.length === keyBuf.length && crypto.timingSafeEqual(tokBuf, keyBuf)) return name;
+    }
   }
   return null;
 }
@@ -394,6 +408,46 @@ function parsePositiveIntEnv(name, def, min, max) {
 
 const FALLBACK_ATTEMPTS = parsePositiveIntEnv("FALLBACK_ATTEMPTS", 3, 1, 10);
 const FALLBACK_DELAY_MS = parsePositiveIntEnv("FALLBACK_DELAY_MS", 300, 0, 10000);
+
+// Copy Claude Code retry/ratelimit headers from the upstream onto the client
+// response (retry-after, x-should-retry, anthropic-ratelimit-unified-*).
+function applyGatewayHeaders(res, upstreamHeaders, status) {
+  try {
+    if (res.headersSent || res.writableEnded) return;
+    const headers = gatewayRetryHeaders(upstreamHeaders, status);
+    for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
+  } catch {}
+}
+
+// Map an upstream failure to the client protocol and send it with gateway
+// headers so Claude Code retries and usage-limit display keep working.
+function sendUpstreamError(res, status, errData, format, upstreamHeaders) {
+  const mapped = mapZenError(status, errData, format);
+  applyGatewayHeaders(res, upstreamHeaders, mapped.status);
+  return res.status(mapped.status).json(mapped.body);
+}
+
+// Forward SSE keep-alives (comments and ping events) to the client so idle
+// watchdogs don't abort long thinking pauses. Call only after headersSent:
+// callers drop pre-stream keep-alives. Returns true when the line was one.
+function forwardKeepAlive(res, line, anthropicStyle) {
+  if (!line || line[0] === ":") {
+    if (!res.writableEnded) {
+      res.write((line || "") + "\n");
+      if (res.flush) res.flush();
+    }
+    return true;
+  }
+  if (line === "event: ping") {
+    if (!res.writableEnded) {
+      if (anthropicStyle) res.write(`event: ping\ndata: {"type":"ping"}\n\n`);
+      else res.write(`: ping\n\n`);
+      if (res.flush) res.flush();
+    }
+    return true;
+  }
+  return false;
+}
 
 function candidateModels(targetModel) {
   const list = [targetModel, ...getFallbackModels(targetModel, CHAT_MODELS, RESPONSES_MODELS)];
@@ -563,6 +617,20 @@ function isResponsesModel(model) {
 
 function isKnownModel(model) {
   return isModelKnown(model, ALL_MODELS);
+}
+
+function defaultFallbackModel() {
+  return CHAT_MODELS[0] || ALL_MODELS[0] || DEFAULT_CHAT_MODELS[0];
+}
+
+// Claude Code sends Anthropic model ids (claude-*, provider-prefixed ids,
+// gateway aliases). Map unknown claude/anthropic ids to the default model
+// instead of 404; all other unknown ids stay unresolved.
+function resolveRequestModel(rawModel) {
+  const fallback = defaultFallbackModel();
+  const resolved = resolveGatewayModel(rawModel, ALL_MODELS, fallback);
+  if (isModelKnown(resolved, ALL_MODELS)) return { model: resolved, known: true };
+  return { model: resolved, known: false };
 }
 
 const MODELS_REFRESH_DEBOUNCE = 5 * 60 * 1000;
@@ -785,6 +853,7 @@ function pipeZenResponses(zenOpts, body, requestedModel, res, extra = {}) {
             req.destroy();
           } catch {}
           if (!res.headersSent && !res.writableEnded) {
+            applyGatewayHeaders(res, zenRes.headers, mapped.status);
             res.status(mapped.status).json(mapped.body);
           } else if (!res.writableEnded) {
             try {
@@ -799,7 +868,10 @@ function pipeZenResponses(zenOpts, body, requestedModel, res, extra = {}) {
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
+        if (!line.startsWith("data: ")) {
+          if (headersSent) forwardKeepAlive(res, line, false);
+          continue;
+        }
         const payload = line.slice(6).trim();
         if (!payload || payload === "[DONE]") continue;
         let ev;
@@ -866,6 +938,7 @@ function pipeZenResponses(zenOpts, body, requestedModel, res, extra = {}) {
       if (!headersSent && !res.headersSent) {
         finished = true;
         const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
+        applyGatewayHeaders(res, undefined, mapped.status);
         res.status(mapped.status).json(mapped.body);
       } else if (!finished) {
         try { finish("stop"); } catch {}
@@ -878,6 +951,7 @@ function pipeZenResponses(zenOpts, body, requestedModel, res, extra = {}) {
     if (!res.headersSent && !headersSent) {
       finished = true;
       const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
+      applyGatewayHeaders(res, undefined, mapped.status);
       res.status(mapped.status).json(mapped.body);
     } else if (headersSent && !finished) {
       try { finish("stop"); } catch {}
@@ -890,6 +964,7 @@ function pipeZenResponses(zenOpts, body, requestedModel, res, extra = {}) {
     if (!res.headersSent && !headersSent) {
       finished = true;
       const mapped = mapZenError(504, { message: "Upstream timeout" }, "openai");
+      applyGatewayHeaders(res, undefined, mapped.status);
       res.status(mapped.status).json(mapped.body);
     } else if (headersSent && !finished) {
       try { finish("stop"); } catch {}
@@ -916,8 +991,8 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens, ext
   let buffer = "";
   let firstChunkHandled = false;
   let finished = false;
-  let textOpen = false;
-  const toolEntries = [];
+  const blocks = createAnthropicBlockTracker((event, data) => sendSSE(event, data));
+  const toolKeyByItem = new Map();
   let outputTokens = 0;
 
   function sendSSE(event, data) {
@@ -948,10 +1023,7 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens, ext
   function closeBlocksAndStop(stopReason) {
     if (finished) return;
     finished = true;
-    const totalBlocks = (textOpen ? 1 : 0) + toolEntries.length;
-    for (let i = 0; i < totalBlocks; i++) {
-      sendSSE("content_block_stop", { type: "content_block_stop", index: i });
-    }
+    blocks.stopAll();
     sendSSE("message_delta", { type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: outputTokens } });
     sendSSE("message_stop", { type: "message_stop" });
     res.end();
@@ -987,6 +1059,7 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens, ext
             req.destroy();
           } catch {}
           if (!res.headersSent && !res.writableEnded) {
+            applyGatewayHeaders(res, zenRes.headers, mapped.status);
             res.status(mapped.status).json(mapped.body);
           } else if (!res.writableEnded) {
             try {
@@ -1001,7 +1074,10 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens, ext
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
+        if (!line.startsWith("data: ")) {
+          if (headersSent) forwardKeepAlive(res, line, true);
+          continue;
+        }
         const payload = line.slice(6).trim();
         if (!payload || payload === "[DONE]") continue;
         let ev;
@@ -1009,34 +1085,40 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens, ext
 
         if (ev.type === "response.output_text.delta" && ev.delta) {
           sendHeaders();
-          if (!textOpen) {
-            sendSSE("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-            textOpen = true;
+          blocks.stopKey("think");
+          const tIdx = blocks.start("text", { type: "text", text: "" });
+          sendSSE("content_block_delta", { type: "content_block_delta", index: tIdx, delta: { type: "text_delta", text: ev.delta } });
+          outputTokens += Math.ceil(ev.delta.length / 4);
+        } else if (
+          (ev.type === "response.reasoning_summary_text.delta" || ev.type === "response.reasoning_text.delta") && ev.delta
+        ) {
+          sendHeaders();
+          if (!blocks.has("think") && !blocks.has("text") && toolKeyByItem.size === 0) {
+            blocks.start("think", { type: "thinking", thinking: "" });
+            sendSSE("content_block_delta", { type: "content_block_delta", index: blocks.keyIndex("think"), delta: { type: "thinking_delta", thinking: ev.delta } });
           }
-          sendSSE("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: ev.delta } });
           outputTokens += Math.ceil(ev.delta.length / 4);
         } else if (ev.type === "response.output_item.added" && ev.item?.type === "function_call") {
           sendHeaders();
-          const blockIdx = (textOpen ? 1 : 0) + toolEntries.length;
-          toolEntries.push({ item_id: ev.item.id, blockIdx, name: ev.item.name || "" });
-          sendSSE("content_block_start", {
-            type: "content_block_start", index: blockIdx,
-            content_block: { type: "tool_use", id: ev.item.call_id || ev.item.id, name: ev.item.name || "" },
-          });
-        } else if (ev.type === "response.function_call_arguments.delta" && ev.delta) {
-          sendHeaders();
-          let entry = toolEntries.find((e) => e.item_id === ev.item_id);
-          if (!entry) {
-            const blockIdx = (textOpen ? 1 : 0) + toolEntries.length;
-            entry = { item_id: ev.item_id, blockIdx, name: "" };
-            toolEntries.push(entry);
-            sendSSE("content_block_start", {
-              type: "content_block_start", index: blockIdx,
-              content_block: { type: "tool_use", id: ev.item_id, name: "" },
+          blocks.stopKey("think");
+          const key = `tool:${ev.item.id}`;
+          if (!toolKeyByItem.has(ev.item.id)) {
+            toolKeyByItem.set(ev.item.id, key);
+            blocks.start(key, {
+              type: "tool_use", id: ev.item.call_id || ev.item.id, name: ev.item.name || "",
             });
           }
+        } else if (ev.type === "response.function_call_arguments.delta" && ev.delta) {
+          sendHeaders();
+          blocks.stopKey("think");
+          let key = toolKeyByItem.get(ev.item_id);
+          if (key === undefined) {
+            key = `tool:${ev.item_id}`;
+            toolKeyByItem.set(ev.item_id, key);
+            blocks.start(key, { type: "tool_use", id: ev.item_id, name: "" });
+          }
           sendSSE("content_block_delta", {
-            type: "content_block_delta", index: entry.blockIdx,
+            type: "content_block_delta", index: blocks.keyIndex(key),
             delta: { type: "input_json_delta", partial_json: ev.delta },
           });
           outputTokens += Math.ceil(ev.delta.length / 4);
@@ -1047,7 +1129,11 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens, ext
             if (item.type === "function_call") { stopReason = "tool_use"; break; }
           }
           closeBlocksAndStop(stopReason);
-        } else if (ev.type === "response.failed" || ev.type === "response.incomplete") {
+        } else if (ev.type === "response.incomplete") {
+          sendHeaders();
+          const reason = ev.response?.incomplete_details?.reason;
+          closeBlocksAndStop(reason === "max_output_tokens" ? "max_tokens" : "end_turn");
+        } else if (ev.type === "response.failed") {
           sendHeaders();
           closeBlocksAndStop("end_turn");
         }
@@ -1068,7 +1154,7 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens, ext
         }
         return;
       }
-      closeBlocksAndStop(toolEntries.length ? "tool_use" : "end_turn");
+      closeBlocksAndStop(toolKeyByItem.size ? "tool_use" : "end_turn");
     });
 
     zenRes.on("error", (e) => {
@@ -1079,6 +1165,7 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens, ext
       if (!headersSent && !res.headersSent) {
         finished = true;
         const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "anthropic");
+        applyGatewayHeaders(res, undefined, mapped.status);
         res.status(mapped.status).json(mapped.body);
       } else if (!finished) {
         try {
@@ -1094,6 +1181,7 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens, ext
     if (!res.headersSent && !headersSent) {
       finished = true;
       const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "anthropic");
+      applyGatewayHeaders(res, undefined, mapped.status);
       res.status(mapped.status).json(mapped.body);
     } else if (!finished) {
       try {
@@ -1109,6 +1197,7 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens, ext
     if (!res.headersSent && !headersSent) {
       finished = true;
       const mapped = mapZenError(504, { message: "Upstream timeout" }, "anthropic");
+      applyGatewayHeaders(res, undefined, mapped.status);
       res.status(mapped.status).json(mapped.body);
     } else if (!finished) {
       try {
@@ -1183,7 +1272,7 @@ function pipeZenResponsesPassthrough(zenOpts, body, requestedModel, res, extra =
           finished = true;
           try { zenRes.resume(); } catch {}
           try { req.destroy(); } catch {}
-          if (!res.headersSent && !res.writableEnded) res.status(mapped.status).json(out);
+          if (!res.headersSent && !res.writableEnded) { applyGatewayHeaders(res, zenRes.headers, mapped.status); res.status(mapped.status).json(out); }
           else if (!res.writableEnded) { try { res.end(); } catch {} }
           return;
         }
@@ -1192,7 +1281,10 @@ function pipeZenResponsesPassthrough(zenOpts, body, requestedModel, res, extra =
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
       for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
+        if (!line.startsWith("data: ")) {
+          if (headersSent) forwardKeepAlive(res, line, false);
+          continue;
+        }
         const payload = line.slice(6).trim();
         if (!payload || payload === "[DONE]") continue;
         let ev;
@@ -1235,6 +1327,7 @@ function pipeZenResponsesPassthrough(zenOpts, body, requestedModel, res, extra =
       if (!headersSent && !res.headersSent) {
         finished = true;
         const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
+        applyGatewayHeaders(res, undefined, mapped.status);
         res.status(mapped.status).json({ error: mapped.body?.error || mapped.body });
       } else if (!finished && !res.writableEnded) { finished = true; try { res.end(); } catch {} }
     });
@@ -1317,7 +1410,7 @@ function pipeChatAsResponses(zenOpts, body, requestedModel, res, extra = {}) {
           finished = true;
           try { zenRes.resume(); } catch {}
           try { req.destroy(); } catch {}
-          if (!res.headersSent && !res.writableEnded) res.status(mapped.status).json({ error: mapped.body?.error || mapped.body });
+          if (!res.headersSent && !res.writableEnded) { applyGatewayHeaders(res, zenRes.headers, mapped.status); res.status(mapped.status).json({ error: mapped.body?.error || mapped.body }); }
           else if (!res.writableEnded) { try { res.end(); } catch {} }
           return;
         }
@@ -1326,7 +1419,10 @@ function pipeChatAsResponses(zenOpts, body, requestedModel, res, extra = {}) {
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
       for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
+        if (!line.startsWith("data: ")) {
+          if (headersSent) forwardKeepAlive(res, line, false);
+          continue;
+        }
         const payload = line.slice(6).trim();
         if (!payload || payload === "[DONE]") continue;
         let parsed;
@@ -1385,6 +1481,7 @@ function pipeChatAsResponses(zenOpts, body, requestedModel, res, extra = {}) {
       if (!headersSent && !res.headersSent) {
         finished = true;
         const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
+        applyGatewayHeaders(res, undefined, mapped.status);
         res.status(mapped.status).json({ error: mapped.body?.error || mapped.body });
       } else if (!finished) { try { finish("completed"); } catch {} }
     });
@@ -1415,27 +1512,27 @@ function pipeChatAsResponses(zenOpts, body, requestedModel, res, extra = {}) {
 
 function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
   res.setHeader("x-zen-served-by", "ocodeproxy");
+  let firstChunk = null;
+  let headersSent = false;
+  let buffer = "";
+  let finished = false;
+  let firstChunkHandled = false;
+
+  function sendHeaders() {
+    if (headersSent || finished) return;
+    headersSent = true;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+      "Transfer-Encoding": "chunked",
+    });
+    res.flushHeaders();
+  }
+
   applyUpstreamProxy(zenOpts);
   const req = https.request(zenOpts, (zenRes) => {
-    let firstChunk = null;
-    let headersSent = false;
-    let buffer = "";
-    let finished = false;
-    let firstChunkHandled = false;
-
-    function sendHeaders() {
-      if (headersSent || finished) return;
-      headersSent = true;
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-        "Transfer-Encoding": "chunked",
-      });
-      res.flushHeaders();
-    }
-
     zenRes.on("data", (chunk) => {
       if (finished) return;
       const str = chunk.toString();
@@ -1466,6 +1563,7 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
             req.destroy();
           } catch {}
           if (!res.headersSent && !res.writableEnded) {
+            applyGatewayHeaders(res, zenRes.headers, mapped.status);
             res.status(mapped.status).json(mapped.body);
           } else if (!res.writableEnded) {
             try {
@@ -1541,6 +1639,7 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
       if (!headersSent && !res.headersSent) {
         finished = true;
         const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
+        applyGatewayHeaders(res, undefined, mapped.status);
         res.status(mapped.status).json(mapped.body);
       } else if (!finished && !res.writableEnded) {
         finished = true;
@@ -1556,6 +1655,7 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
     if (!res.headersSent && !headersSent) {
       finished = true;
       const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
+      applyGatewayHeaders(res, undefined, mapped.status);
       res.status(mapped.status).json(mapped.body);
     } else if (!finished && res.writableEnded === false) {
       finished = true;
@@ -1571,6 +1671,7 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
     if (!res.headersSent && !headersSent) {
       finished = true;
       const mapped = mapZenError(504, { message: "Upstream timeout" }, "openai");
+      applyGatewayHeaders(res, undefined, mapped.status);
       res.status(mapped.status).json(mapped.body);
     } else if (!finished) {
       finished = true;
@@ -1596,67 +1697,66 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
 function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, extra = {}) {
   res.setHeader("x-zen-served-by", "ocodeproxy");
   const msgId = ocId("msg");
+  let headersSent = false;
+  let buffer = "";
+  let outputTokens = 0;
+  const blocks = createAnthropicBlockTracker((event, data) => sendSSE(event, data));
+  const toolKeys = new Set();
+  let firstChunkHandled = false;
+  let finished = false;
+  let stopSent = false;
+
+  function sendSSE(event, data) {
+    if (finished || stopSent || res.writableEnded) return;
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    if (res.flush) res.flush();
+  }
+
+  function sendStopOnce(stopReason) {
+    if (stopSent || res.writableEnded) return;
+    try {
+      blocks.stopAll();
+    } catch {}
+    stopSent = true;
+    try {
+      res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: outputTokens } })}\n\n`);
+      res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
+      if (res.flush) res.flush();
+    } catch {}
+  }
+
+  function endAnthropicStream(stopReason) {
+    if (finished) return;
+    sendStopOnce(stopReason);
+    finished = true;
+    try {
+      if (!res.writableEnded) res.end();
+    } catch {}
+  }
+
+  function sendHeaders() {
+    if (headersSent || finished) return;
+    headersSent = true;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    res.flushHeaders();
+
+    sendSSE("message_start", {
+      type: "message_start",
+      message: {
+        id: msgId, type: "message", role: "assistant", content: [],
+        model, stop_reason: null,
+        usage: { input_tokens: inputTokens || 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+    });
+  }
 
   applyUpstreamProxy(zenOpts);
   const req = https.request(zenOpts, (zenRes) => {
-    let headersSent = false;
-    let buffer = "";
-    let outputTokens = 0;
-    let contentIdx = 0;
-    let toolIdx = -1;
-    let firstChunkHandled = false;
-    let finished = false;
-    let stopSent = false;
-
-    function sendSSE(event, data) {
-      if (finished || stopSent || res.writableEnded) return;
-      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-      if (res.flush) res.flush();
-    }
-
-    function sendStopOnce(stopReason) {
-      if (stopSent || res.writableEnded) return;
-      stopSent = true;
-      try {
-        const totalBlocks = (contentIdx > 0 ? 1 : 0) + (toolIdx >= 0 ? toolIdx + 1 : 0);
-        for (let i = 0; i < totalBlocks; i++) {
-          res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: i })}\n\n`);
-        }
-        res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: outputTokens } })}\n\n`);
-        res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
-        if (res.flush) res.flush();
-      } catch {}
-    }
-
-    function endAnthropicStream(stopReason) {
-      if (finished) return;
-      sendStopOnce(stopReason);
-      finished = true;
-      try {
-        if (!res.writableEnded) res.end();
-      } catch {}
-    }
-
-    function sendHeaders() {
-      if (headersSent || finished) return;
-      headersSent = true;
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-      });
-      res.flushHeaders();
-
-      sendSSE("message_start", {
-        type: "message_start",
-        message: {
-          id: msgId, type: "message", role: "assistant", content: [],
-          model, stop_reason: null,
-          usage: { input_tokens: inputTokens || 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
-        },
-      });
-    }
 
     zenRes.on("data", (chunk) => {
       if (finished) return;
@@ -1687,6 +1787,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, extra = {}) 
             req.destroy();
           } catch {}
           if (!res.headersSent && !res.writableEnded) {
+            applyGatewayHeaders(res, zenRes.headers, mapped.status);
             res.status(mapped.status).json(mapped.body);
           } else if (!res.writableEnded) {
             try {
@@ -1701,7 +1802,10 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, extra = {}) 
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
+        if (!line.startsWith("data: ")) {
+          if (headersSent) forwardKeepAlive(res, line, true);
+          continue;
+        }
         const payload = line.slice(6).trim();
         if (payload === "[DONE]") continue;
 
@@ -1712,41 +1816,42 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, extra = {}) 
 
         sendHeaders();
 
-        if (delta.content) {
-          if (contentIdx === 0 && toolIdx === -1) {
-            sendSSE("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-            contentIdx = 1;
+        if (delta.reasoning_content) {
+          if (!blocks.has("think") && !blocks.has("text") && toolKeys.size === 0) {
+            blocks.start("think", { type: "thinking", thinking: "" });
+            sendSSE("content_block_delta", {
+              type: "content_block_delta", index: blocks.keyIndex("think"),
+              delta: { type: "thinking_delta", thinking: delta.reasoning_content },
+            });
           }
+          outputTokens += Math.ceil(delta.reasoning_content.length / 4);
+        }
+
+        if (delta.content) {
+          blocks.stopKey("think");
+          const tIdx = blocks.start("text", { type: "text", text: "" });
           sendSSE("content_block_delta", {
-            type: "content_block_delta", index: 0,
+            type: "content_block_delta", index: tIdx,
             delta: { type: "text_delta", text: delta.content },
           });
           outputTokens += Math.ceil(delta.content.length / 4);
-        }
-
-        if (delta.reasoning_content) {
-          outputTokens += Math.ceil(delta.reasoning_content.length / 4);
         }
 
         if (delta.tool_calls) {
           for (const tc of delta.tool_calls) {
             if (FINGERPRINT_TOOLS.includes(tc.function?.name)) continue;
             const idx = tc.index ?? 0;
-            if (idx > toolIdx) {
-              if (toolIdx === -1 && contentIdx > 0) {
-                sendSSE("content_block_stop", { type: "content_block_stop", index: 0 });
-              }
-              toolIdx = idx;
-              const blockIdx = contentIdx > 0 ? idx + 1 : idx;
-              sendSSE("content_block_start", {
-                type: "content_block_start", index: blockIdx,
-                content_block: { type: "tool_use", id: tc.id || ocId("toolu"), name: tc.function?.name || "" },
+            const key = `tool:${idx}`;
+            if (!toolKeys.has(idx)) {
+              blocks.stopKey("think");
+              toolKeys.add(idx);
+              blocks.start(key, {
+                type: "tool_use", id: tc.id || ocId("toolu"), name: tc.function?.name || "",
               });
             }
             if (tc.function?.arguments) {
-              const blockIdx = contentIdx > 0 ? idx + 1 : idx;
               sendSSE("content_block_delta", {
-                type: "content_block_delta", index: blockIdx,
+                type: "content_block_delta", index: blocks.keyIndex(key),
                 delta: { type: "input_json_delta", partial_json: tc.function.arguments },
               });
               outputTokens += Math.ceil(tc.function.arguments.length / 4);
@@ -1759,6 +1864,8 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, extra = {}) 
           let stopReason = "end_turn";
           if (fr === "tool_calls") stopReason = "tool_use";
           else if (fr === "length") stopReason = "max_tokens";
+          else if (fr === "stop_sequence") stopReason = "stop_sequence";
+          else if (fr === "content_filter") stopReason = "refusal";
           sendStopOnce(stopReason);
         }
       }
@@ -1778,7 +1885,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, extra = {}) 
         }
         return;
       }
-      if (!stopSent) sendStopOnce(toolIdx >= 0 ? "tool_use" : "end_turn");
+      if (!stopSent) sendStopOnce(toolKeys.size > 0 ? "tool_use" : "end_turn");
       if (!finished && !res.writableEnded) {
         finished = true;
         try {
@@ -1795,6 +1902,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, extra = {}) 
       if (!headersSent && !res.headersSent) {
         finished = true;
         const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "anthropic");
+        applyGatewayHeaders(res, undefined, mapped.status);
         res.status(mapped.status).json(mapped.body);
       } else if (!finished) {
         endAnthropicStream("end_turn");
@@ -1810,6 +1918,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, extra = {}) 
     if (!res.headersSent && !headersSent) {
       finished = true;
       const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "anthropic");
+      applyGatewayHeaders(res, undefined, mapped.status);
       res.status(mapped.status).json(mapped.body);
     } else if (!finished) {
       endAnthropicStream("end_turn");
@@ -1822,6 +1931,7 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, extra = {}) 
     if (!res.headersSent && !headersSent) {
       finished = true;
       const mapped = mapZenError(504, { message: "Upstream timeout" }, "anthropic");
+      applyGatewayHeaders(res, undefined, mapped.status);
       res.status(mapped.status).json(mapped.body);
     } else if (!finished) {
       endAnthropicStream("end_turn");
@@ -1848,16 +1958,35 @@ app.get("/v1/models", async (req, res) => {
     return res.status(mapped.status).json(mapped.body);
   }
 
-  await maybeRefreshModels();
+  // Serve from cache instantly: Claude Code discovery (GET /v1/models?limit=1000)
+  // fails on slow responses (3s timeout, redirect = failure), so refresh runs
+  // in the background. display_name/description keep the /model picker useful.
+  maybeRefreshModels().catch(() => {});
 
   res.setHeader("x-zen-served-by", "ocodeproxy");
+  // Claude Code discovery: GET /v1/models?limit=1000, 3s timeout, redirect =
+  // failure. Serve from cache, honor limit, include claude-compatible alias
+  // ids (discovery filter keeps only ids containing claude/anthropic).
+  let limit = 1000;
+  const rawLimit = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
+  if (rawLimit !== undefined) {
+    const n = Number(rawLimit);
+    if (Number.isInteger(n) && n > 0) limit = Math.min(n, 1000);
+  }
+  const ids = buildDiscoveryList(ALL_MODELS).slice(0, limit);
   res.json({
     object: "list",
-    data: ALL_MODELS.map((id) => ({
+    data: ids.map((id) => ({
       id,
       object: "model",
+      type: "model",
       created: 1779000000,
+      created_at: "2026-07-24T00:00:00Z",
       owned_by: "opencode-free",
+      display_name: id,
+      description: isClaudeGatewayId(id) && !ALL_MODELS.includes(id)
+        ? `OCodeProxy alias for ${defaultFallbackModel()}`
+        : "OCodeProxy Zen gateway model",
     })),
   });
 });
@@ -1875,7 +2004,7 @@ app.get("/v1/models/:id", async (req, res) => {
       error: { message: "Model not found", type: "not_found_error", code: "model_not_found" },
     });
   }
-  const id = resolveModel(rawId.trim());
+  const id = resolveRequestModel(rawId.trim()).model;
 
   if (isDeprecatedModel(id)) {
     return res.status(404).json({
@@ -1922,7 +2051,7 @@ app.post("/v1/chat/completions", async (req, res) => {
     });
   }
 
-  const targetModel = resolveModel(model.trim());
+  let targetModel = resolveRequestModel(model.trim()).model;
 
   if (isDeprecatedModel(targetModel)) {
     return res.status(400).json({
@@ -1932,6 +2061,7 @@ app.post("/v1/chat/completions", async (req, res) => {
 
   if (!isKnownModel(targetModel)) {
     await maybeRefreshModels();
+    targetModel = resolveRequestModel(model.trim()).model;
   }
 
   if (!isKnownModel(targetModel)) {
@@ -1956,11 +2086,13 @@ app.post("/v1/chat/completions", async (req, res) => {
 
         if (zenResp.error || zenResp.status >= 400) {
           const mapped = mapZenError(zenResp.status, zenResp.error, "openai");
+          applyGatewayHeaders(res, zenResp.headers, mapped.status);
           return res.status(mapped.status).json(mapped.body);
         }
         res.json(aggregateResponsesSseToOpenAI(zenResp.raw, zenResp.model));
       } catch (e) {
         const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
+        applyGatewayHeaders(res, undefined, mapped.status);
         res.status(mapped.status).json(mapped.body);
       }
     }
@@ -1977,11 +2109,13 @@ app.post("/v1/chat/completions", async (req, res) => {
 
       if (zenResp.error || zenResp.status >= 400) {
         const mapped = mapZenError(zenResp.status, zenResp.error, "openai");
+        applyGatewayHeaders(res, zenResp.headers, mapped.status);
         return res.status(mapped.status).json(mapped.body);
       }
       res.json(aggregateSseToCompletion(zenResp.raw, zenResp.model));
     } catch (e) {
       const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
+      applyGatewayHeaders(res, undefined, mapped.status);
       res.status(mapped.status).json(mapped.body);
     }
   }
@@ -1996,20 +2130,17 @@ app.post("/v1/messages", async (req, res) => {
 
   const reqBody = req.body && typeof req.body === "object" ? req.body : {};
   const { model, stream } = reqBody;
-  if (typeof model !== "string" || !model.trim()) {
-    return res.status(400).json({
+  const validationError = validateAnthropicMessagesBody(reqBody);
+  if (validationError) {
+    const status = validationError.startsWith("Missing required field: model") ? 400 : 400;
+    return res.status(status).json({
       type: "error",
-      error: { type: "invalid_request_error", message: "Missing required field: model (string)" },
-    });
-  }
-  if (!Array.isArray(reqBody.messages)) {
-    return res.status(400).json({
-      type: "error",
-      error: { type: "invalid_request_error", message: "Missing required field: messages (array)" },
+      error: { type: "invalid_request_error", message: validationError },
+      request_id: ocId("req"),
     });
   }
 
-  const targetModel = resolveModel(model.trim());
+  let targetModel = resolveRequestModel(model.trim()).model;
 
   if (isDeprecatedModel(targetModel)) {
     return res.status(400).json({
@@ -2020,6 +2151,7 @@ app.post("/v1/messages", async (req, res) => {
 
   if (!isKnownModel(targetModel)) {
     await maybeRefreshModels();
+    targetModel = resolveRequestModel(model.trim()).model;
   }
 
   if (!isKnownModel(targetModel)) {
@@ -2029,7 +2161,22 @@ app.post("/v1/messages", async (req, res) => {
     });
   }
 
+  // max_tokens: 0 pre-warms the prompt cache without generating a response.
+  if (reqBody.max_tokens === 0) {
+    res.setHeader("x-zen-served-by", "ocodeproxy");
+    return res.json({
+      id: ocId("msg"),
+      type: "message",
+      role: "assistant",
+      content: [],
+      model: targetModel,
+      stop_reason: "end_turn",
+      usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+  }
+
   res.setHeader("x-zen-served-by", "ocodeproxy");
+  res.setHeader("request-id", ocId("req"));
   const sessionId = getSession(user);
   const { messages, tools, params } = anthropicToOpenAI(reqBody);
   const inputTokens = 0;
@@ -2047,11 +2194,13 @@ app.post("/v1/messages", async (req, res) => {
 
         if (zenResp.error || zenResp.status >= 400) {
           const mapped = mapZenError(zenResp.status, zenResp.error, "anthropic");
+          applyGatewayHeaders(res, zenResp.headers, mapped.status);
           return res.status(mapped.status).json(mapped.body);
         }
         res.json(openAIToAnthropic(aggregateResponsesSseToOpenAI(zenResp.raw, zenResp.model), zenResp.model, inputTokens));
       } catch (e) {
         const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "anthropic");
+        applyGatewayHeaders(res, undefined, mapped.status);
         res.status(mapped.status).json(mapped.body);
       }
     }
@@ -2068,11 +2217,13 @@ app.post("/v1/messages", async (req, res) => {
 
       if (zenResp.error || zenResp.status >= 400) {
         const mapped = mapZenError(zenResp.status, zenResp.error, "anthropic");
+        applyGatewayHeaders(res, zenResp.headers, mapped.status);
         return res.status(mapped.status).json(mapped.body);
       }
       res.json(openAIToAnthropic(aggregateSseToCompletion(zenResp.raw, zenResp.model), zenResp.model, inputTokens));
     } catch (e) {
       const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "anthropic");
+      applyGatewayHeaders(res, undefined, mapped.status);
       res.status(mapped.status).json(mapped.body);
     }
   }
@@ -2091,12 +2242,13 @@ app.post("/v1/responses", async (req, res) => {
   if (typeof input !== "string" && !Array.isArray(input)) {
     return res.status(400).json({ error: { message: "Missing required field: input (string or array)", type: "invalid_request_error", code: "missing_input" } });
   }
-  const targetModel = resolveModel(model.trim());
+  let targetModel = resolveRequestModel(model.trim()).model;
   if (isDeprecatedModel(targetModel)) {
     return res.status(400).json({ error: { message: `Model '${targetModel}' is discontinued and no longer supported.`, type: "invalid_request_error", code: "model_deprecated" } });
   }
   if (!isKnownModel(targetModel)) {
     await maybeRefreshModels();
+    targetModel = resolveRequestModel(model.trim()).model;
   }
   if (!isKnownModel(targetModel)) {
     return res.status(404).json({ error: { message: `Model '${targetModel}' not found.`, type: "not_found_error", code: "model_not_found" } });
@@ -2115,11 +2267,13 @@ app.post("/v1/responses", async (req, res) => {
         const zenResp = await collectAttempts(attempts);
         if (zenResp.error || zenResp.status >= 400) {
           const mapped = mapZenError(zenResp.status, zenResp.error, "openai");
+          applyGatewayHeaders(res, zenResp.headers, mapped.status);
           return res.status(mapped.status).json({ error: mapped.body?.error || mapped.body });
         }
         res.json(aggregateResponsesSseToResponses(zenResp.raw, zenResp.model));
       } catch (e) {
         const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
+        applyGatewayHeaders(res, undefined, mapped.status);
         res.status(mapped.status).json({ error: mapped.body?.error || mapped.body });
       }
     }
@@ -2140,11 +2294,13 @@ app.post("/v1/responses", async (req, res) => {
       const zenResp = await collectAttempts(chatAttemptsList);
       if (zenResp.error || zenResp.status >= 400) {
         const mapped = mapZenError(zenResp.status, zenResp.error, "openai");
+        applyGatewayHeaders(res, zenResp.headers, mapped.status);
         return res.status(mapped.status).json({ error: mapped.body?.error || mapped.body });
       }
       res.json(chatCompletionToResponses(aggregateSseToCompletion(zenResp.raw, zenResp.model), zenResp.model));
     } catch (e) {
       const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "openai");
+      applyGatewayHeaders(res, undefined, mapped.status);
       res.status(mapped.status).json({ error: mapped.body?.error || mapped.body });
     }
   }
@@ -2160,12 +2316,13 @@ app.post("/v1/messages/count_tokens", async (req, res) => {
   if (typeof model !== "string" || !model.trim()) {
     return res.status(400).json({ type: "error", error: { type: "invalid_request_error", message: "Missing required field: model (string)" } });
   }
-  const targetModel = resolveModel(model.trim());
+  let targetModel = resolveRequestModel(model.trim()).model;
   if (isDeprecatedModel(targetModel)) {
     return res.status(400).json({ type: "error", error: { type: "invalid_request_error", message: `Model '${targetModel}' is discontinued and no longer supported.` } });
   }
   if (!isKnownModel(targetModel)) {
     await maybeRefreshModels();
+    targetModel = resolveRequestModel(model.trim()).model;
   }
   if (!isKnownModel(targetModel)) {
     return res.status(404).json({ type: "error", error: { type: "not_found_error", message: `Model '${targetModel}' not found.` } });
@@ -2212,6 +2369,15 @@ app.get("/", (_req, res) => {
       "/v1/messages/count_tokens",
     ],
   });
+});
+
+// Claude Code connection-warming probe (HEAD, no credentials). Answered
+// locally with a static 200 and never forwarded upstream.
+app.head("/api/hello", (_req, res) => {
+  res.status(200).end();
+});
+app.get("/api/hello", (_req, res) => {
+  res.status(200).json({ status: "ok" });
 });
 
 app.use((err, req, res, _next) => {

@@ -7,6 +7,7 @@ import {
   detectUpstreamError,
   retryAfterMs,
   isRetryableUpstreamStatus,
+  gatewayRetryHeaders,
 } from "../lib/errors.mjs";
 
 describe("responsesErrorStatus", () => {
@@ -92,5 +93,23 @@ describe("isRetryableUpstreamStatus", () => {
     assert.equal(isRetryableUpstreamStatus(404), false);
     assert.equal(isRetryableUpstreamStatus(200), false);
     assert.equal(isRetryableUpstreamStatus(undefined), false);
+  });
+});
+
+describe("gatewayRetryHeaders", () => {
+  it("synthesizes retry hints on errors", () => {
+    assert.deepEqual(gatewayRetryHeaders(undefined, 429), { "retry-after": "5", "x-should-retry": "true" });
+    assert.deepEqual(gatewayRetryHeaders(undefined, 502), { "x-should-retry": "true" });
+    assert.deepEqual(gatewayRetryHeaders(undefined, 400), { "x-should-retry": "false" });
+    assert.deepEqual(gatewayRetryHeaders(undefined, 200), {});
+  });
+  it("forwards upstream values case-insensitively", () => {
+    const out = gatewayRetryHeaders(
+      { "Retry-After": "2", "X-Should-Retry": "false", "Anthropic-Ratelimit-Unified-Limit": "100" },
+      429
+    );
+    assert.equal(out["retry-after"], "2");
+    assert.equal(out["x-should-retry"], "false");
+    assert.equal(out["anthropic-ratelimit-unified-limit"], "100");
   });
 });
