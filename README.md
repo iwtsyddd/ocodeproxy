@@ -6,9 +6,29 @@ Local gateway that exposes OpenCode Zen upstream as OpenAI / Responses / Anthrop
 SDK / Client (OpenAI / Anthropic) --> localhost:6446 --> opencode.ai /zen/v1
 ```
 
+> **Disclaimer.** OCodeProxy is an independent, unofficial third-party project.
+> It is not affiliated with, endorsed by, or supported by OpenCode (sst),
+> Anthropic, or OpenAI in any way. All trademarks belong to their respective
+> owners. This gateway exists for interoperability and research purposes only;
+> users are solely responsible for complying with the terms of service of any
+> upstream provider they connect through it.
+
 ## Status
 
 Early development (`v0.1.0-t1`). The API, config, and behavior will change without notice. Not production-ready.
+
+> **Stability warning.** OCodeProxy is experimental software under active development.
+> It is an unofficial gateway: upstream changes at `opencode.ai` can break it at
+> any time, and there are no stability guarantees of any kind.
+>
+> ZenDiet rewrites proxied requests to save context (tool-output trimming,
+> deduplication, and — only when explicitly enabled — tool-description slimming).
+> Trimming is conservative by default, but any request rewriting carries a small
+> risk of altering model behavior. The experimental slimming mode (`ZEN_TOOL_SLIM=1`)
+> goes further and may degrade tool selection.
+>
+> If a session starts acting strangely, switch ZenDiet to `safe` or `off`
+> (Settings menu, live, no restart) and retry before reporting a bug.
 
 Protocol maturity is uneven:
 
@@ -100,6 +120,8 @@ node server.mjs --port 8080
 | `PROXY_CONFIG_FILE` | `./proxy-config.json` | Persisted upstream proxy URL |
 | `UPSTREAM_PROXY` / `ALL_PROXY` / `HTTPS_PROXY` | `""` | Egress proxy, e.g. `socks5://127.0.0.1:1080` (uppercase names only) |
 | `ZEN_AUTH_MODE` | `public` | Upstream Zen auth mode, sent as `Authorization: Bearer ...` |
+| `ZEN_DIET` | `balanced` | Context optimization mode (`balanced`, `safe`, `aggressive`, `off`) |
+| `ZEN_TOOL_SLIM` | `""` (off) | Experimental tool-description slimming (`1` truncates long tool descriptions to their first sentence; may degrade tool selection) |
 | `FALLBACK_ATTEMPTS` | `3` | Models to try in fallback chain (`1-10`) |
 | `FALLBACK_DELAY_MS` | `300` | Delay between fallbacks (`0-10000`) |
 | `OC_VERSION` | auto | Pinned `opencode/x.y.z` User-Agent version, refreshed from npm every 6h |
@@ -211,12 +233,16 @@ Prompts auto-disable when stdin is not a TTY (CI, Docker, background jobs).
 Request log format:
 
 ```text
-[HH:MM:SS] METHOD path STATUS_CODE durationms
+[HH:MM:SS] METHOD path STATUS_CODE durationms[ diet -Xk (tools N%)]
 ```
+
+The `diet` suffix appears on proxied requests when ZenDiet is enabled: estimated
+tokens saved by optimization and the pre-diet tool-results share of context.
 
 ## How It Works
 
 - Normalization (`lib/convert.mjs`): Chat / Responses / Anthropic translation, fingerprint decoy tools, assistant reasoning blocks.
+- ZenDiet (`lib/zendiet.mjs`, `lib/zendiet/*`): context governor (pressure calculation, sha256 deduplication with ANSI-normalized hashing, noise stripping with repetition collapse, huge-output emergency reduction, test/diff preservation, opt-in tool-description slimming).
 - Routing (`lib/models.mjs`): alias resolution, discontinued-model filter, `chat` vs `muse-spark* responses` partition.
 - Fallback (`lib/fallback.mjs`): candidate model list, buffered retry (`collectWithFallback`) and pre-headers stream failover (`tryStreamFallback`).
 - Errors (`lib/errors.mjs`): Zen errors mapped to OpenAI / Anthropic shapes, network details sanitized.
@@ -235,7 +261,7 @@ Why: classifier verdicts come from the upstream model server. This proxy's upstr
 
 Honest list of things that are stubbed, partial, or intentional hacks:
 
-- **Usage tokens are stubbed.** Streaming `message_start` and non-streaming responses report `input_tokens: 0`. Streaming `output_tokens` is estimated as `ceil(chars/4)` (thinking + text + tool JSON). Aggregates report `0` when upstream omits usage.
+- **Usage tokens are estimated.** Streaming `message_start`, non-streaming responses, and TUI traffic stats report estimated `input_tokens` based on request content and ZenDiet optimization. Streaming `output_tokens` is estimated as `ceil(chars/4)` (thinking + text + tool JSON). Aggregates report upstream usage when provided.
 - **`count_tokens` is a heuristic.** Character-length based (+85/image, +20/document), not a real tokenizer. Accepts Claude model ids (mapped to the default model for the 404 check).
 - **Mid-stream failures are masked.** After headers are sent, upstream errors/timeouts end the stream as a normal `stop` / `end_turn` instead of surfacing an error.
 - **Gateway retry headers on buffered errors.** `retry-after` / `x-should-retry` / `anthropic-ratelimit-unified-*` forwarding applies to all buffered (non-streaming) error paths; post-headers streaming errors still can't carry them.
@@ -243,8 +269,9 @@ Honest list of things that are stubbed, partial, or intentional hacks:
 - **Decoy tools.** Every upstream request injects `bash` / `glob` / `grep` / `read` fingerprint tools that are stripped from outputs. Upstream behavior may change if Zen starts validating these.
 - **Model list is filtered.** Zen inventory is the source of truth; `DISCONTINUED_MODELS` stays authoritative for exclusions. Free detection is name-based (`*free*`, `big-pickle`) plus cost-based (`cost.input/output == 0` from the models.dev catalog), so suffixless free models are kept when Zen serves them. models.dev also provides `context_window` / `max_output_tokens` / `description` for `/v1/models`; `status: deprecated` there is informational only and never filters. Without metadata (fetch failed, disabled via `MODELS_DEV_URL=""`), the gateway degrades to name-based behavior.
 - **Upstream coupling.** All traffic goes to `opencode.ai/zen/v1/*` with a forged `opencode/...` User-Agent. Upstream changes can break the proxy at any time.
-- **Tests are unit-only.** 136 tests cover `lib/` converters, errors, models, catalog, and fallback. `server.mjs` routes have no integration tests.
+- **Tests are unit-only.** 191 tests cover `lib/` converters, errors, models, catalog, fallback, and zendiet. `server.mjs` routes have no integration tests.
 - **Intentional spec deviations (Anthropic path).** `max_tokens: 0` returns an empty pre-warm message without an upstream call (extension, not Anthropic behavior). Attribution detection matches any leading `system` text containing both `cc_version=` and `cch=` — a `system` prompt that merely mentions those substrings alongside real instructions is dropped as a whole. `thinking: between_tools` maps to `reasoning_effort: none`.
+- **Tool slimming is experimental.** `ZEN_TOOL_SLIM=1` (or the Settings toggle) shortens tool descriptions over 300 chars to their first sentence. Names, parameters and schemas are never touched and tools are never dropped, but the model may select tools less accurately. Off by default; toggle live without restart.
 
 ## Project Structure
 
@@ -259,8 +286,10 @@ OCodeProxy/
 │   ├── fallback.mjs     # collect / stream fallback orchestration
 │   ├── keys.mjs         # key gen / mask / validate
 │   ├── ids.mjs          # session/message ids
-│   └── content.mjs      # content helpers + token estimate
-├── test/               # node:test suites (convert, errors, models...)
+│   ├── content.mjs      # content helpers + token estimate
+│   ├── zendiet.mjs      # ZenDiet context governor coordinator
+│   └── zendiet/         # safety, analyzer, dedup, classifier, reducers
+├── test/               # node:test suites (convert, errors, models, zendiet...)
 ├── package.json        # scripts: start / dev / test
 └── .gitignore          # node_modules, secrets, local files
 ```
@@ -281,6 +310,8 @@ npm test
 | `fallback.test.mjs` | Retry orchestration |
 | `ids-keys.test.mjs` | ID format, key validation |
 | `sampling.test.mjs` | Sampling / conversion edge cases |
+| `zendiet.test.mjs` | Safety invariants, pressure, dedup, tool reducers |
+| `zendiet-tools.test.mjs` | Tool-description slimming (shapes, thresholds, opt-in wiring) |
 
 Never commit real keys: `api-keys.json`, `models.json`, `proxy-config.json`, and `.env` are git-ignored.
 

@@ -64,6 +64,7 @@ import {
   gatewayRetryHeaders,
 } from "./lib/errors.mjs";
 import { collectWithFallback, tryStreamFallback } from "./lib/fallback.mjs";
+import { optimizeContext, estimateRequestTokens } from "./lib/zendiet.mjs";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -91,6 +92,13 @@ const MODELS_DEV_URL = process.env.MODELS_DEV_URL || MODELS_DEV_DEFAULT_URL;
 const MODELS_DEV_FILE = process.env.MODELS_DEV_FILE || MODELS_DEV_DEFAULT_FILE;
 const MODELS_DEV_TTL_MS = parsePositiveIntEnv("MODELS_DEV_TTL_MS", MODELS_DEV_DEFAULT_TTL_MS, 60 * 1000, 30 * 24 * 60 * 60 * 1000);
 const PROXY_CONFIG_FILE = process.env.PROXY_CONFIG_FILE || "./proxy-config.json";
+let zenDietMode = (process.env.ZEN_DIET || "balanced").toLowerCase();
+if (!["balanced", "safe", "aggressive", "off"].includes(zenDietMode)) {
+  zenDietMode = "balanced";
+}
+// Experimental: shorten long tool descriptions to their first sentence.
+// May degrade tool selection; off by default, toggle live in Settings.
+let zenToolSlim = ["1", "true", "yes", "on"].includes(String(process.env.ZEN_TOOL_SLIM ?? "").toLowerCase().trim());
 
 let upstreamProxyUrl = process.env.UPSTREAM_PROXY || process.env.ALL_PROXY || process.env.HTTPS_PROXY || "";
 let upstreamProxyAgent = null;
@@ -275,13 +283,29 @@ async function promptPortSelection(current) {
   return Number(choice);
 }
 
+// Diet status color: red flags aggressive mode and description slimming
+// (both can degrade agent behavior), green otherwise.
+function dietStatusColor() {
+  return zenDietMode === "aggressive" || zenToolSlim ? pc.red : pc.green;
+}
+
+// Per-request diet summary for the access log. Shows estimated savings and
+// the tool-results share of context, so small savings are explainable.
+function formatDietSuffix(info) {
+  if (!info || !Number.isFinite(info.totalTokens) || info.totalTokens <= 0) return "";
+  const saved = Math.max(0, Math.round(info.savedTokens || 0));
+  const fmt = saved >= 1000 ? `${(saved / 1000).toFixed(1)}k` : `${saved}`;
+  return ` diet -${fmt} (tools ${info.toolShare || 0}%)`;
+}
+
 app.use((req, res, next) => {
   const start = Date.now();
   res.on("finish", () => {
     const duration = Date.now() - start;
     const time = new Date().toLocaleTimeString();
+    const dietSuffix = formatDietSuffix(req.dietInfo);
     if (!process.stdout.isTTY) {
-      console.error(`[${time}] ${req.method.padEnd(6)} ${req.originalUrl.padEnd(24)} ${res.statusCode} ${duration}ms`);
+      console.error(`[${time}] ${req.method.padEnd(6)} ${req.originalUrl.padEnd(24)} ${res.statusCode} ${duration}ms${dietSuffix}`);
       return;
     }
     const statusColor =
@@ -298,7 +322,8 @@ app.use((req, res, next) => {
       `${pc.bold(pc.cyan(req.method.padEnd(6)))} ` +
       `${req.originalUrl.padEnd(24)} ` +
       `${statusColor(String(res.statusCode))} ` +
-      `${pc.dim(`${duration}ms`)}`
+      `${pc.dim(`${duration}ms`)}` +
+      (dietSuffix ? pc.dim(dietSuffix) : "")
     );
   });
   next();
@@ -468,8 +493,14 @@ function candidateModels(targetModel) {
   return sliced;
 }
 
-function fallbackExtra(attempts) {
-  return { attempts, attemptIndex: 0, fallbackDelayMs: FALLBACK_DELAY_MS };
+function fallbackExtra(attempts, inTokens = 0) {
+  return {
+    attempts,
+    inTokens,
+    attemptIndex: 0,
+    fallbackDelayMs: FALLBACK_DELAY_MS,
+    onDone: (outTokens) => recordStreamResult(inTokens, outTokens),
+  };
 }
 
 function chatAttempts(models, messages, tools, tool_choice, sessionId, params, zenKey) {
@@ -486,6 +517,70 @@ function responsesDirectAttempts(models, input, instructions, tools, tool_choice
 
 function collectAttempts(attempts) {
   return collectWithFallback(attempts, (options, body) => collectZenSse(options, body), { fallbackDelayMs: FALLBACK_DELAY_MS });
+}
+
+// Extract estimated token counts from a buffered upstream result. Prefers
+// real upstream usage when the aggregator preserved it, else falls back to
+// a chars/4 estimate over the raw SSE payload. Returns { inTok, outTok }.
+function estimateBufferedTokens(zenResp) {
+  const raw = typeof zenResp?.raw === "string" ? zenResp.raw : "";
+  let usage = null;
+  for (const m of raw.matchAll(/"(?:prompt_tokens|input_tokens)"\s*:\s*(\d+)[^}]*?"(?:completion_tokens|output_tokens)"\s*:\s*(\d+)/g)) {
+    usage = { inTok: Number(m[1]), outTok: Number(m[2]) };
+  }
+  if (usage) return usage;
+  return { inTok: 0, outTok: Math.ceil(raw.replace(/data:\s*\[DONE\]/g, "").length / 4) };
+}
+
+function recordBufferedResult(zenResp, inTokens = 0) {
+  if (!zenResp) return;
+  STATS.requests += 1;
+  if (zenResp.error || Number(zenResp.status) >= 400) {
+    STATS.upstreamErrors += 1;
+    return;
+  }
+  const { inTok, outTok } = estimateBufferedTokens(zenResp);
+  const finalIn = inTok > 0 ? inTok : (inTokens || 0);
+  STATS.inTokens += finalIn;
+  STATS.outTokens += outTok;
+}
+
+function recordStreamResult(inTokens, outTokens) {
+  STATS.requests += 1;
+  if (Number.isFinite(inTokens) && inTokens > 0) STATS.inTokens += Math.round(inTokens);
+  if (Number.isFinite(outTokens) && outTokens > 0) STATS.outTokens += Math.round(outTokens);
+}
+
+function applyZenDietIfEnabled(model, messages, tools, extra = {}) {
+  if (zenDietMode === "off") return { messages, tools, changed: false };
+  const pre = estimateRequestTokens({ messages, tools });
+  const dietRes = optimizeContext({ messages, tools }, {
+    mode: zenDietMode,
+    model,
+    contextWindow: META_MAP.get(model)?.contextWindow || 128_000,
+    headers: extra.headers,
+    client: extra.client,
+    toolSlim: zenToolSlim,
+  });
+  if (extra.req) {
+    extra.req.dietInfo = {
+      savedTokens: dietRes.changed ? dietRes.stats.savedTokens : 0,
+      toolShare: pre.total > 0 ? Math.round((pre.toolResults / pre.total) * 100) : 0,
+      totalTokens: pre.total,
+    };
+  }
+  if (dietRes.changed) {
+    STATS.zenDietSavedChars += dietRes.stats.savedChars;
+    STATS.zenDietSavedTokens += dietRes.stats.savedTokens;
+    STATS.zenDietOptimizedReqs += 1;
+    return {
+      messages: Array.isArray(dietRes.request.messages) ? dietRes.request.messages : messages,
+      tools: Array.isArray(dietRes.request.tools) ? dietRes.request.tools : tools,
+      changed: true,
+      stats: dietRes.stats,
+    };
+  }
+  return { messages, tools, changed: false, stats: dietRes.stats };
 }
 
 function zenRequest(model, messages, _stream, tools, tool_choice, sessionId, params, zenKey) {
@@ -641,6 +736,27 @@ function loadModels() {
   } catch {}
 }
 loadModels();
+
+// Lifetime gateway stats (reset on restart): estimated tokens served,
+// completed requests, upstream timeouts and upstream errors.
+const STATS = {
+  inTokens: 0,
+  outTokens: 0,
+  requests: 0,
+  timeouts: 0,
+  upstreamErrors: 0,
+  zenDietSavedTokens: 0,
+  zenDietSavedChars: 0,
+  zenDietOptimizedReqs: 0,
+};
+const STARTED_AT = Date.now();
+
+function logUpstreamTimeout(model, elapsedMs) {
+  STATS.timeouts += 1;
+  const label = typeof model === "string" && model ? model : "unknown model";
+  console.error(pc.yellow(`⚠ Upstream timeout: ${label} after ${elapsedMs}ms`));
+}
+
 
 function isDeprecatedModel(model) {
   return isModelDeprecated(model);
@@ -903,6 +1019,7 @@ function collectZenSse(zenOpts, body) {
 
 function pipeZenResponses(zenOpts, body, requestedModel, res, extra = {}) {
   res.setHeader("x-zen-served-by", "ocodeproxy");
+  const upstreamStartedAt = Date.now();
   const chatId = ocId("chatcmpl");
   const created = Math.floor(Date.now() / 1000);
   let headersSent = false;
@@ -910,6 +1027,7 @@ function pipeZenResponses(zenOpts, body, requestedModel, res, extra = {}) {
   let firstChunkHandled = false;
   const toolMap = new Map();
   let finished = false;
+  let outChars = 0;
 
   function sendHeaders() {
     if (headersSent) return;
@@ -933,6 +1051,9 @@ function pipeZenResponses(zenOpts, body, requestedModel, res, extra = {}) {
   function finish(finishReason) {
     if (finished) return;
     finished = true;
+    try {
+      extra.onDone?.(Math.ceil(outChars / 4));
+    } catch {}
     sendHeaders();
     sendDelta({}, finishReason);
     res.write("data: [DONE]\n\n");
@@ -945,6 +1066,7 @@ function pipeZenResponses(zenOpts, body, requestedModel, res, extra = {}) {
       if (finished) return;
       const str = chunk.toString();
       buffer += str;
+      outChars += str.length;
       if (!firstChunkHandled) {
         const det = detectUpstreamError(buffer);
         if (det.needMore) return;
@@ -1076,6 +1198,7 @@ function pipeZenResponses(zenOpts, body, requestedModel, res, extra = {}) {
 
   req.on("timeout", () => {
     req.destroy();
+    logUpstreamTimeout(requestedModel, Date.now() - upstreamStartedAt);
     if (finished || res.writableEnded) return;
     if (!res.headersSent && !headersSent) {
       finished = true;
@@ -1102,6 +1225,7 @@ function pipeZenResponses(zenOpts, body, requestedModel, res, extra = {}) {
 
 function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens, extra = {}) {
   res.setHeader("x-zen-served-by", "ocodeproxy");
+  const upstreamStartedAt = Date.now();
   const msgId = ocId("msg");
   let headersSent = false;
   let buffer = "";
@@ -1140,6 +1264,9 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens, ext
     if (finished) return;
     finished = true;
     blocks.stopAll();
+    try {
+      extra.onDone?.(outputTokens);
+    } catch {}
     sendSSE("message_delta", { type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: outputTokens } });
     sendSSE("message_stop", { type: "message_stop" });
     res.end();
@@ -1344,6 +1471,7 @@ function pipeZenResponsesPassthrough(zenOpts, body, requestedModel, res, extra =
   let firstChunkHandled = false;
   let finished = false;
   const toolMap = new Map();
+  let outChars = 0;
 
   function sendHeaders() {
     if (headersSent || finished) return;
@@ -1362,6 +1490,9 @@ function pipeZenResponsesPassthrough(zenOpts, body, requestedModel, res, extra =
   function finish(completed) {
     if (finished) return;
     finished = true;
+    try {
+      extra.onDone?.(Math.ceil(outChars / 4));
+    } catch {}
     sendHeaders();
     res.write(`data: ${JSON.stringify({ type: "response.completed", response: completed })}\n\n`);
     res.end();
@@ -1372,6 +1503,7 @@ function pipeZenResponsesPassthrough(zenOpts, body, requestedModel, res, extra =
     zenRes.on("data", (chunk) => {
       if (finished) return;
       buffer += chunk.toString();
+      outChars += chunk.length;
       if (!firstChunkHandled) {
         const det = detectUpstreamError(buffer);
         if (det.needMore) return;
@@ -1501,6 +1633,13 @@ function pipeChatAsResponses(zenOpts, body, requestedModel, res, extra = {}) {
   function finish(status = "completed") {
     if (finished) return;
     finished = true;
+    try {
+      const outTok = usage && Number.isFinite(usage.completion_tokens) ? usage.completion_tokens : 0;
+      const inTok = usage && Number.isFinite(usage.prompt_tokens) ? usage.prompt_tokens : (extra?.inTokens || 0);
+      STATS.requests += 1;
+      STATS.inTokens += inTok;
+      STATS.outTokens += outTok;
+    } catch {}
     sendHeaders();
     res.write(`data: ${JSON.stringify({ type: "response.completed", response: { id: respId, model: requestedModel, status, usage: usage ? { input_tokens: usage.prompt_tokens ?? 0, output_tokens: usage.completion_tokens ?? 0, total_tokens: usage.total_tokens ?? 0 } : undefined } })}\n\n`);
     res.end();
@@ -1633,6 +1772,15 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
   let buffer = "";
   let finished = false;
   let firstChunkHandled = false;
+  let outChars = 0;
+
+  function doneStreaming() {
+    if (finished) return;
+    finished = true;
+    try {
+      extra.onDone?.(Math.ceil(outChars / 4));
+    } catch {}
+  }
 
   function sendHeaders() {
     if (headersSent || finished) return;
@@ -1653,6 +1801,7 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
       if (finished) return;
       const str = chunk.toString();
       buffer += str;
+      outChars += str.length;
       if (!firstChunkHandled) {
         const det = detectUpstreamError(buffer);
         if (det.needMore) return;
@@ -1742,7 +1891,7 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
         return;
       }
       if (headersSent && !finished && !res.writableEnded) {
-        finished = true;
+        doneStreaming();
         res.end();
       }
     });
@@ -1758,7 +1907,7 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
         applyGatewayHeaders(res, undefined, mapped.status);
         res.status(mapped.status).json(mapped.body);
       } else if (!finished && !res.writableEnded) {
-        finished = true;
+        doneStreaming();
         try {
           res.end();
         } catch {}
@@ -1774,7 +1923,7 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
       applyGatewayHeaders(res, undefined, mapped.status);
       res.status(mapped.status).json(mapped.body);
     } else if (!finished && res.writableEnded === false) {
-      finished = true;
+      doneStreaming();
       try {
         res.end();
       } catch {}
@@ -1834,6 +1983,9 @@ function pipeZenAsAnthropic(zenOpts, body, model, res, inputTokens, extra = {}) 
       blocks.stopAll();
     } catch {}
     stopSent = true;
+    try {
+      extra.onDone?.(outputTokens);
+    } catch {}
     try {
       res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: outputTokens } })}\n\n`);
       res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
@@ -2175,14 +2327,20 @@ app.post("/v1/chat/completions", async (req, res) => {
   const zenKey = zenKeyFromReq(req);
   const models = candidateModels(targetModel);
 
+  const diet = applyZenDietIfEnabled(targetModel, messages, tools, { headers: req.headers, req });
+  messages = diet.messages;
+  tools = diet.tools;
+  const inTokens = estimateRequestTokens({ messages, tools }).total;
+
   if (isResponsesModel(targetModel)) {
     const attempts = responsesAttempts(models, messages, tools, tool_choice, sessionId, reqBody, zenKey);
     if (stream) {
       const first = attempts[0];
-      pipeZenResponses(first.options, first.body, first.model, res, fallbackExtra(attempts));
+      pipeZenResponses(first.options, first.body, first.model, res, fallbackExtra(attempts, inTokens));
     } else {
       try {
         const zenResp = await collectAttempts(attempts);
+        recordBufferedResult(zenResp, inTokens);
 
         if (zenResp.error || zenResp.status >= 400) {
           const mapped = mapZenError(zenResp.status, zenResp.error, "openai");
@@ -2202,10 +2360,11 @@ app.post("/v1/chat/completions", async (req, res) => {
   const chatAttemptsList = chatAttempts(models, messages, tools, tool_choice, sessionId, reqBody, zenKey);
   if (stream) {
     const first = chatAttemptsList[0];
-    pipeZenResponse(first.options, first.body, true, res, fallbackExtra(chatAttemptsList));
+    pipeZenResponse(first.options, first.body, true, res, fallbackExtra(chatAttemptsList, inTokens));
   } else {
     try {
       const zenResp = await collectAttempts(chatAttemptsList);
+      recordBufferedResult(zenResp, inTokens);
 
       if (zenResp.error || zenResp.status >= 400) {
         const mapped = mapZenError(zenResp.status, zenResp.error, "openai");
@@ -2278,8 +2437,11 @@ app.post("/v1/messages", async (req, res) => {
   res.setHeader("x-zen-served-by", "ocodeproxy");
   res.setHeader("request-id", ocId("req"));
   const sessionId = getSession(user);
-  const { messages, tools, params } = anthropicToOpenAI(reqBody);
-  const inputTokens = 0;
+  let { messages, tools, params } = anthropicToOpenAI(reqBody);
+  const diet = applyZenDietIfEnabled(targetModel, messages, tools, { headers: req.headers, req });
+  messages = diet.messages;
+  tools = diet.tools;
+  const inTokens = estimateRequestTokens({ messages, tools }).total;
   const zenKey = zenKeyFromReq(req);
   const models = candidateModels(targetModel);
 
@@ -2287,17 +2449,18 @@ app.post("/v1/messages", async (req, res) => {
     const attempts = responsesAttempts(models, messages, tools, undefined, sessionId, params, zenKey);
     if (stream) {
       const first = attempts[0];
-      pipeZenResponsesAsAnthropic(first.options, first.body, first.model, res, inputTokens, fallbackExtra(attempts));
+      pipeZenResponsesAsAnthropic(first.options, first.body, first.model, res, inTokens, fallbackExtra(attempts, inTokens));
     } else {
       try {
         const zenResp = await collectAttempts(attempts);
+        recordBufferedResult(zenResp, inTokens);
 
         if (zenResp.error || zenResp.status >= 400) {
           const mapped = mapZenError(zenResp.status, zenResp.error, "anthropic");
           applyGatewayHeaders(res, zenResp.headers, mapped.status);
           return res.status(mapped.status).json(mapped.body);
         }
-        res.json(openAIToAnthropic(aggregateResponsesSseToOpenAI(zenResp.raw, zenResp.model), zenResp.model, inputTokens));
+        res.json(openAIToAnthropic(aggregateResponsesSseToOpenAI(zenResp.raw, zenResp.model), zenResp.model, inTokens));
       } catch (e) {
         const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "anthropic");
         applyGatewayHeaders(res, undefined, mapped.status);
@@ -2310,17 +2473,18 @@ app.post("/v1/messages", async (req, res) => {
   const chatAttemptsList = chatAttempts(models, messages, tools, undefined, sessionId, params, zenKey);
   if (stream) {
     const first = chatAttemptsList[0];
-    pipeZenAsAnthropic(first.options, first.body, first.model, res, inputTokens, fallbackExtra(chatAttemptsList));
+    pipeZenAsAnthropic(first.options, first.body, first.model, res, inTokens, fallbackExtra(chatAttemptsList, inTokens));
   } else {
     try {
       const zenResp = await collectAttempts(chatAttemptsList);
+      recordBufferedResult(zenResp, inTokens);
 
       if (zenResp.error || zenResp.status >= 400) {
         const mapped = mapZenError(zenResp.status, zenResp.error, "anthropic");
         applyGatewayHeaders(res, zenResp.headers, mapped.status);
         return res.status(mapped.status).json(mapped.body);
       }
-      res.json(openAIToAnthropic(aggregateSseToCompletion(zenResp.raw, zenResp.model), zenResp.model, inputTokens));
+      res.json(openAIToAnthropic(aggregateSseToCompletion(zenResp.raw, zenResp.model), zenResp.model, inTokens));
     } catch (e) {
       const mapped = mapZenError(502, { message: publicNetworkMessage(e) }, "anthropic");
       applyGatewayHeaders(res, undefined, mapped.status);
@@ -2359,12 +2523,14 @@ app.post("/v1/responses", async (req, res) => {
   const models = candidateModels(targetModel);
   if (isResponsesModel(targetModel)) {
     const attempts = responsesDirectAttempts(models, input, instructions, tools, tool_choice, sessionId, body, zenKey);
+    const inTokens = estimateRequestTokens({ messages: responsesInputToChatMessages(input, instructions) }).total;
     if (stream) {
       const first = attempts[0];
-      pipeZenResponsesPassthrough(first.options, first.body, first.model, res, fallbackExtra(attempts));
+      pipeZenResponsesPassthrough(first.options, first.body, first.model, res, fallbackExtra(attempts, inTokens));
     } else {
       try {
         const zenResp = await collectAttempts(attempts);
+        recordBufferedResult(zenResp, inTokens);
         if (zenResp.error || zenResp.status >= 400) {
           const mapped = mapZenError(zenResp.status, zenResp.error, "openai");
           applyGatewayHeaders(res, zenResp.headers, mapped.status);
@@ -2379,8 +2545,12 @@ app.post("/v1/responses", async (req, res) => {
     }
     return;
   }
-  const messages = responsesInputToChatMessages(input, instructions);
-  const normalizedTools = normalizeResponsesTools(tools).map((t) => ({ type: "function", function: t }));
+  let messages = responsesInputToChatMessages(input, instructions);
+  let normalizedTools = normalizeResponsesTools(tools).map((t) => ({ type: "function", function: t }));
+  const diet = applyZenDietIfEnabled(targetModel, messages, normalizedTools.length ? normalizedTools : undefined, { headers: req.headers, req });
+  messages = diet.messages;
+  if (diet.tools) normalizedTools = diet.tools;
+  const inTokens = estimateRequestTokens({ messages, tools: normalizedTools }).total;
   const chatParams = { ...body };
   if (chatParams.max_output_tokens !== undefined && chatParams.max_tokens === undefined && chatParams.max_completion_tokens === undefined) {
     chatParams.max_tokens = chatParams.max_output_tokens;
@@ -2388,10 +2558,11 @@ app.post("/v1/responses", async (req, res) => {
   const chatAttemptsList = chatAttempts(models, messages, normalizedTools.length ? normalizedTools : undefined, tool_choice, sessionId, chatParams, zenKey);
   if (stream) {
     const first = chatAttemptsList[0];
-    pipeChatAsResponses(first.options, first.body, first.model, res, fallbackExtra(chatAttemptsList));
+    pipeChatAsResponses(first.options, first.body, first.model, res, fallbackExtra(chatAttemptsList, inTokens));
   } else {
     try {
       const zenResp = await collectAttempts(chatAttemptsList);
+      recordBufferedResult(zenResp, inTokens);
       if (zenResp.error || zenResp.status >= 400) {
         const mapped = mapZenError(zenResp.status, zenResp.error, "openai");
         applyGatewayHeaders(res, zenResp.headers, mapped.status);
@@ -2442,6 +2613,12 @@ app.get("/health", (_req, res) => {
     ocVersion: ocVersion,
     zenAuthMode: ZEN_AUTH_MODE,
     upstreamProxyConfigured: Boolean(upstreamProxyUrl),
+    zenDiet: {
+      mode: zenDietMode,
+      savedTokens: STATS.zenDietSavedTokens,
+      savedChars: STATS.zenDietSavedChars,
+      optimizedRequests: STATS.zenDietOptimizedReqs,
+    },
     endpoints: [
       "/health",
       "/v1/models",
@@ -2513,8 +2690,8 @@ function renderBanner(port) {
   const content = [
     `${pc.bold(pc.magenta("⚡ OCodeProxy"))} ${pc.dim(TUI_VERSION)}`,
     "",
-    `${pc.bold("Status:")}    ${pc.green("● ONLINE")}`,
     `${pc.bold("Models:")}    ${pc.cyan(String(ALL_MODELS.length))} ${pc.dim("upstream models")}`,
+    `${pc.bold("ZenDiet:")}   ${dietStatusColor()(`● ${zenDietMode.toUpperCase()}${zenToolSlim ? "+SLIM" : ""}`)} ${pc.dim("(Context Governor)")}`,
     `${pc.bold("Local:")}     ${pc.cyan(localUrl)}`,
     `${pc.bold("Network:")}   ${pc.dim(networkUrl)}`,
     ...(upstreamProxyUrl ? [`${pc.bold("Proxy:")}     ${pc.yellow(upstreamProxyUrl)}`] : []),
@@ -2706,6 +2883,7 @@ async function openSettingsMenu() {
         { value: "refresh_meta", label: "Refresh model metadata (models.dev)", hint: metaSource === "live" ? `${META_MAP.size} entries` : "not loaded" },
         { value: "new_key", label: "Generate new API key", hint: "create key with custom name" },
         { value: "regenerate_keys", label: "Regenerate default keys", hint: "reset admin & user-default" },
+        { value: "zendiet", label: "ZenDiet Mode (Token Saver)", hint: `current: ${zenDietMode.toUpperCase()}${zenToolSlim ? "+SLIM" : ""}` },
         { value: "list_keys", label: "View active API keys", hint: `source: ${KEYS_FILE}` },
         { value: "back", label: "Back to server", hint: "resume proxy" },
       ],
@@ -2833,6 +3011,31 @@ async function openSettingsMenu() {
       for (const [name, key] of Object.entries(apiKeys)) {
         p.log.message(`  ${pc.bold(name.padEnd(14))} ${pc.dim(maskKey(key))}`);
       }
+    } else if (action === "zendiet") {
+      const modeChoice = await p.select({
+        message: "Select ZenDiet optimization mode:",
+        options: [
+          { value: "balanced", label: "Balanced (Recommended)", hint: "dedup + safe reduction at 70% pressure" },
+          { value: "safe", label: "Safe", hint: "dedup + terminal noise stripping only" },
+          { value: "aggressive", label: "Aggressive", hint: "active reduction at 55% pressure" },
+          { value: "off", label: "Off", hint: "bypass all context optimization" },
+        ],
+      });
+      if (!p.isCancel(modeChoice)) {
+        zenDietMode = modeChoice;
+        p.log.success(pc.green(`✔ ZenDiet mode set to: ${pc.bold(zenDietMode.toUpperCase())}`));
+      }
+      const slimChoice = await p.select({
+        message: "Slim long tool descriptions to first sentence? (experimental, may degrade tool use)",
+        options: [
+          { value: "on", label: "On", hint: "saves tokens on large tool schemas" },
+          { value: "off", label: "Off", hint: "keep full tool descriptions" },
+        ],
+      });
+      if (!p.isCancel(slimChoice)) {
+        zenToolSlim = slimChoice === "on";
+        p.log.success(pc.green(`✔ Tool slimming ${zenToolSlim ? "enabled" : "disabled"}`));
+      }
     }
   }
 
@@ -2840,12 +3043,20 @@ async function openSettingsMenu() {
 
 let settingsOpen = false;
 
+function formatUptime() {
+  const s = Math.floor((Date.now() - STARTED_AT) / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+
 function showInfoPanel() {
   const meta = META_MAP.get(defaultFallbackModel());
   const content = [
-    `${pc.bold(pc.cyan("ℹ️  OCodeProxy Info"))} ${pc.dim(TUI_VERSION)}`,
+    `${pc.bold(pc.cyan("ℹ️  OCodeProxy Info"))} ${pc.dim(`${TUI_VERSION} · up ${formatUptime()} · port ${currentPort}`)}`,
     "",
-    `${pc.bold("Server:")}    ${pc.green("● ONLINE")} ${pc.dim(`port ${currentPort}`)}`,
     `${pc.bold("Upstream:")}  ${pc.dim(`opencode.ai/zen/v1 (${ZEN_AUTH_MODE})`)}`,
     `${pc.bold("OpenCode:")}  ${pc.dim(`opencode/${ocVersion}`)}`,
     `${pc.bold("Models:")}    ${pc.cyan(String(ALL_MODELS.length))} ${pc.dim(`discovered (${metaSource} meta: ${META_MAP.size})`)}`,
@@ -2854,6 +3065,10 @@ function showInfoPanel() {
       : []),
     ...(upstreamProxyUrl ? [`${pc.bold("Proxy:")}     ${pc.yellow(upstreamProxyUrl)}`] : []),
     `${pc.bold("Keys:")}      ${pc.dim(`${Object.keys(apiKeys).length} local (${KEYS_FILE})`)}`,
+    "",
+    `${pc.bold("ZenDiet:")}   ${dietStatusColor()(`● ${zenDietMode.toUpperCase()}${zenToolSlim ? "+SLIM" : ""}`)} ${pc.dim(`(~${STATS.zenDietSavedTokens} tok saved · ${STATS.zenDietOptimizedReqs} reqs)`)}`,
+    `${pc.bold("Traffic:")}   ${pc.dim(`${STATS.requests} req · in ~${STATS.inTokens} / out ~${STATS.outTokens} tok (est.)`)}`,
+    `${pc.bold("Upstream:")}  ${pc.dim(`${STATS.timeouts} timeouts · ${STATS.upstreamErrors} errors`)}`,
     ...(process.stdin.isTTY ? ["", pc.dim("Press any key to return")] : []),
   ].join("\n");
   console.log(

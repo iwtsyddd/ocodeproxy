@@ -1,12 +1,37 @@
+# deps & build
 node_modules/
-template/
+dist/
+build/
+coverage/
+.nyc_output/
+
+# logs
 *.log
+npm-debug.log*
+
+# local secrets & runtime state
 .env
+.env.*
 api-keys.json
+*.corrupt-*.bak
 models.json
 models-meta.json
 proxy-config.json
-.DS_Store
-Thumbs.db
+
+# local scratch (never publish)
+*-tmp.*
+zendiet.md
+
+# project-internal (not for publish)
+template/
 AGENTS.md
 assets/logo.svg
+
+# OS & editors
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
