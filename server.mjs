@@ -65,6 +65,7 @@ import {
 } from "./lib/errors.mjs";
 import { collectWithFallback, tryStreamFallback } from "./lib/fallback.mjs";
 import { optimizeContext, estimateRequestTokens } from "./lib/zendiet.mjs";
+import { repairChatMessages, repairResponsesInput } from "./lib/repair.mjs";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -74,7 +75,7 @@ if (process.stdout.isTTY) {
   process.stdout.write("\x1b]0;OCodeProxy\x07");
 }
 
-const TUI_VERSION = "v0.1.0-t1";
+const TUI_VERSION = "v0.1.1-t3";
 const PROXY_VERSION = process.env.PROXY_VERSION || "16";
 const FALLBACK_OC_VERSION = "1.18.31";
 let ocVersion = process.env.OC_VERSION || FALLBACK_OC_VERSION;
@@ -2291,7 +2292,7 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
 
   const reqBody = req.body && typeof req.body === "object" ? req.body : {};
-  const { model, messages, stream, tools, tool_choice } = reqBody;
+  let { model, messages, stream, tools, tool_choice } = reqBody;
   if (typeof model !== "string" || !model.trim()) {
     return res.status(400).json({
       error: { message: "Missing required field: model (string)", type: "invalid_request_error", code: "missing_model" },
@@ -2327,6 +2328,7 @@ app.post("/v1/chat/completions", async (req, res) => {
   const zenKey = zenKeyFromReq(req);
   const models = candidateModels(targetModel);
 
+  messages = repairChatMessages(messages);
   const diet = applyZenDietIfEnabled(targetModel, messages, tools, { headers: req.headers, req });
   messages = diet.messages;
   tools = diet.tools;
@@ -2438,6 +2440,7 @@ app.post("/v1/messages", async (req, res) => {
   res.setHeader("request-id", ocId("req"));
   const sessionId = getSession(user);
   let { messages, tools, params } = anthropicToOpenAI(reqBody);
+  messages = repairChatMessages(messages);
   const diet = applyZenDietIfEnabled(targetModel, messages, tools, { headers: req.headers, req });
   messages = diet.messages;
   tools = diet.tools;
@@ -2522,8 +2525,9 @@ app.post("/v1/responses", async (req, res) => {
   const zenKey = zenKeyFromReq(req);
   const models = candidateModels(targetModel);
   if (isResponsesModel(targetModel)) {
-    const attempts = responsesDirectAttempts(models, input, instructions, tools, tool_choice, sessionId, body, zenKey);
-    const inTokens = estimateRequestTokens({ messages: responsesInputToChatMessages(input, instructions) }).total;
+    const repairedInput = repairResponsesInput(input);
+    const attempts = responsesDirectAttempts(models, repairedInput, instructions, tools, tool_choice, sessionId, body, zenKey);
+    const inTokens = estimateRequestTokens({ messages: responsesInputToChatMessages(repairedInput, instructions) }).total;
     if (stream) {
       const first = attempts[0];
       pipeZenResponsesPassthrough(first.options, first.body, first.model, res, fallbackExtra(attempts, inTokens));
@@ -2546,6 +2550,7 @@ app.post("/v1/responses", async (req, res) => {
     return;
   }
   let messages = responsesInputToChatMessages(input, instructions);
+  messages = repairChatMessages(messages);
   let normalizedTools = normalizeResponsesTools(tools).map((t) => ({ type: "function", function: t }));
   const diet = applyZenDietIfEnabled(targetModel, messages, normalizedTools.length ? normalizedTools : undefined, { headers: req.headers, req });
   messages = diet.messages;

@@ -1,6 +1,6 @@
 {
   "name": "ocodeproxy",
-  "version": "0.1.0-t1",
+  "version": "0.1.1-t3",
   "description": "Unofficial OpenCode Zen gateway — use its models from any OpenAI, Responses, or Anthropic client",
   "type": "module",
   "main": "server.mjs",

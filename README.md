@@ -15,7 +15,7 @@ SDK / Client (OpenAI / Anthropic) --> localhost:6446 --> opencode.ai /zen/v1
 
 ## Status
 
-Early development (`v0.1.0-t1`). The API, config, and behavior will change without notice. Not production-ready.
+Early development (`v0.1.1-t3`). The API, config, and behavior will change without notice. Not production-ready.
 
 > **Stability warning.** OCodeProxy is experimental software under active development.
 > It is an unofficial gateway: upstream changes at `opencode.ai` can break it at
@@ -242,6 +242,7 @@ tokens saved by optimization and the pre-diet tool-results share of context.
 ## How It Works
 
 - Normalization (`lib/convert.mjs`): Chat / Responses / Anthropic translation, fingerprint decoy tools, assistant reasoning blocks.
+- Repair (`lib/repair.mjs`): closes user-interrupted orphan tool calls with cancellation stubs, folds consecutive user messages (chat + Responses shapes).
 - ZenDiet (`lib/zendiet.mjs`, `lib/zendiet/*`): context governor (pressure calculation, sha256 deduplication with ANSI-normalized hashing, noise stripping with repetition collapse, huge-output emergency reduction, test/diff preservation, opt-in tool-description slimming).
 - Routing (`lib/models.mjs`): alias resolution, discontinued-model filter, `chat` vs `muse-spark* responses` partition.
 - Fallback (`lib/fallback.mjs`): candidate model list, buffered retry (`collectWithFallback`) and pre-headers stream failover (`tryStreamFallback`).
@@ -269,8 +270,9 @@ Honest list of things that are stubbed, partial, or intentional hacks:
 - **Decoy tools.** Every upstream request injects `bash` / `glob` / `grep` / `read` fingerprint tools that are stripped from outputs. Upstream behavior may change if Zen starts validating these.
 - **Model list is filtered.** Zen inventory is the source of truth; `DISCONTINUED_MODELS` stays authoritative for exclusions. Free detection is name-based (`*free*`, `big-pickle`) plus cost-based (`cost.input/output == 0` from the models.dev catalog), so suffixless free models are kept when Zen serves them. models.dev also provides `context_window` / `max_output_tokens` / `description` for `/v1/models`; `status: deprecated` there is informational only and never filters. Without metadata (fetch failed, disabled via `MODELS_DEV_URL=""`), the gateway degrades to name-based behavior.
 - **Upstream coupling.** All traffic goes to `opencode.ai/zen/v1/*` with a forged `opencode/...` User-Agent. Upstream changes can break the proxy at any time.
-- **Tests are unit-only.** 191 tests cover `lib/` converters, errors, models, catalog, fallback, and zendiet. `server.mjs` routes have no integration tests.
+- **Tests are unit-only.** 203 tests cover `lib/` converters, errors, models, catalog, fallback, repair, and zendiet. `server.mjs` routes have no integration tests.
 - **Intentional spec deviations (Anthropic path).** `max_tokens: 0` returns an empty pre-warm message without an upstream call (extension, not Anthropic behavior). Attribution detection matches any leading `system` text containing both `cc_version=` and `cch=` — a `system` prompt that merely mentions those substrings alongside real instructions is dropped as a whole. `thinking: between_tools` maps to `reasoning_effort: none`.
+- **Interrupted sessions are repaired.** User-cancelled tool calls leave orphan `tool_use` blocks that strict upstreams reject with `400 invalid parameters`. The gateway auto-closes each orphan with a `[Tool execution was cancelled or rejected by user]` stub and folds runs of consecutive `user` messages into one, before diet/forwarding. This repair always runs (independent of ZenDiet mode) because unrepaired requests cannot succeed upstream.
 - **Tool slimming is experimental.** `ZEN_TOOL_SLIM=1` (or the Settings toggle) shortens tool descriptions over 300 chars to their first sentence. Names, parameters and schemas are never touched and tools are never dropped, but the model may select tools less accurately. Off by default; toggle live without restart.
 
 ## Project Structure
@@ -287,8 +289,9 @@ OCodeProxy/
 │   ├── keys.mjs         # key gen / mask / validate
 │   ├── ids.mjs          # session/message ids
 │   ├── content.mjs      # content helpers + token estimate
+│   ├── repair.mjs       # orphan tool-call stubs + user folding
 │   ├── zendiet.mjs      # ZenDiet context governor coordinator
-│   └── zendiet/         # safety, analyzer, dedup, classifier, reducers
+│   └── zendiet/         # safety, analyzer, dedup, classifier, reducers, tools
 ├── test/               # node:test suites (convert, errors, models, zendiet...)
 ├── package.json        # scripts: start / dev / test
 └── .gitignore          # node_modules, secrets, local files
@@ -312,6 +315,7 @@ npm test
 | `sampling.test.mjs` | Sampling / conversion edge cases |
 | `zendiet.test.mjs` | Safety invariants, pressure, dedup, tool reducers |
 | `zendiet-tools.test.mjs` | Tool-description slimming (shapes, thresholds, opt-in wiring) |
+| `repair.test.mjs` | Orphan tool-call stubs, user-message folding (chat + Responses shapes) |
 
 Never commit real keys: `api-keys.json`, `models.json`, `proxy-config.json`, and `.env` are git-ignored.
 
