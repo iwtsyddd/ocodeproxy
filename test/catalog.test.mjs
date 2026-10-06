@@ -120,6 +120,31 @@ describe("metaForId", () => {
     assert.equal(metaForId("unknown", map, "also-unknown"), undefined);
     assert.equal(metaForId("unknown", null, null), undefined);
   });
+  it("resolves model aliases before falling back to default fallback model", () => {
+    const map = parseModelsDevCatalog(PAYLOAD);
+    const aliases = { "alias-to-grok": "grok-code", "alias-to-pickle": "big-pickle" };
+    const res = metaForId("alias-to-grok", map, "big-pickle", aliases);
+    assert.equal(res.contextWindow, 131072);
+    assert.equal(res.aliasFor, "grok-code");
+    assert.equal(res.id, "alias-to-grok");
+
+    // When id is not in aliases, falls back to fallback model
+    const fallbackRes = metaForId("claude-opus-4-5", map, "big-pickle", aliases);
+    assert.equal(fallbackRes.contextWindow, 200000);
+    assert.equal(fallbackRes.aliasFor, "big-pickle");
+  });
+  it("handles aliased fallback models and defensive bad inputs", () => {
+    const map = parseModelsDevCatalog(PAYLOAD);
+    const aliases = { "fallback-alias": "grok-code" };
+    const res = metaForId("unmapped-model", map, "fallback-alias", aliases);
+    assert.equal(res.contextWindow, 131072);
+    assert.equal(res.aliasFor, "grok-code");
+
+    assert.equal(metaForId("", map, "big-pickle"), undefined);
+    assert.equal(metaForId(null, map, "big-pickle"), undefined);
+    assert.equal(metaForId(undefined, map, "big-pickle"), undefined);
+    assert.equal(metaForId(123, map, "big-pickle"), undefined);
+  });
 });
 
 describe("isResponsesByNpm", () => {

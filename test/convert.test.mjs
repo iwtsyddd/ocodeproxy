@@ -18,6 +18,9 @@ import {
   responsesToOpenAI,
   aggregateSseToCompletion,
   aggregateResponsesSseToOpenAI,
+  createUnifiedSseAggregator,
+  responsesToolCallKey,
+  responsesToolCallKeys,
   anthropicToOpenAI,
   openAIToAnthropic,
   isAttributionText,
@@ -25,6 +28,7 @@ import {
   validateAnthropicMessagesBody,
   anthropicParamsToChat,
   createAnthropicBlockTracker,
+  createChatToolTracker,
 } from "../lib/convert.mjs";
 
 describe("openAIContentToResponsesText", () => {
@@ -229,11 +233,110 @@ describe("aggregateResponsesSseToOpenAI", () => {
     assert.deepEqual(out.choices[0].message.tool_calls[0].function, { name: "read", arguments: '{"a":1}' });
     assert.deepEqual(out.usage, { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 });
   });
+  it("synchronizes item_id and call_id across added and delta events without duplicating tool calls", () => {
+    const raw = sse([
+      { type: "response.output_item.added", item: { type: "function_call", id: "item_999", call_id: "call_abc", name: "fetch_data" } },
+      // Delta sent with item_id matching item.id
+      { type: "response.function_call_arguments.delta", item_id: "item_999", delta: '{"page":' },
+      // Delta sent with call_id matching item.call_id
+      { type: "response.function_call_arguments.delta", call_id: "call_abc", delta: "1}" },
+      { type: "response.output_item.done", item: { type: "function_call", id: "item_999", call_id: "call_abc", name: "fetch_data" } },
+      { type: "response.completed", response: { status: "completed" } },
+    ]);
+    const out = aggregateResponsesSseToOpenAI(raw, "m");
+    assert.equal(out.choices[0].finish_reason, "tool_calls");
+    assert.equal(out.choices[0].message.tool_calls.length, 1);
+    assert.equal(out.choices[0].message.tool_calls[0].id, "call_abc");
+    assert.equal(out.choices[0].message.tool_calls[0].function.name, "fetch_data");
+    assert.equal(out.choices[0].message.tool_calls[0].function.arguments, '{"page":1}');
+  });
+  it("accumulates arguments when delta arrives before output_item.added or done", () => {
+    const raw = sse([
+      // First delta arrives keyed by item_id
+      { type: "response.function_call_arguments.delta", item_id: "call_first", delta: '{"arg":' },
+      { type: "response.function_call_arguments.delta", item_id: "call_first", delta: '"val"}' },
+      // Later added event supplies name and aliased call_id
+      { type: "response.output_item.added", item: { type: "function_call", id: "call_first", call_id: "call_first_canon", name: "custom_op" } },
+      { type: "response.completed", response: { status: "completed" } },
+    ]);
+    const out = aggregateResponsesSseToOpenAI(raw, "m");
+    assert.equal(out.choices[0].message.tool_calls.length, 1);
+    assert.equal(out.choices[0].message.tool_calls[0].id, "call_first_canon");
+    assert.equal(out.choices[0].message.tool_calls[0].function.name, "custom_op");
+    assert.equal(out.choices[0].message.tool_calls[0].function.arguments, '{"arg":"val"}');
+  });
+  it("preserves ordering for multiple distinct tool calls with aliased keys", () => {
+    const raw = sse([
+      { type: "response.output_item.added", item: { type: "function_call", id: "i1", call_id: "c1", name: "tool1" } },
+      { type: "response.output_item.added", item: { type: "function_call", id: "i2", call_id: "c2", name: "tool2" } },
+      { type: "response.function_call_arguments.delta", item_id: "i1", delta: '{"a":' },
+      { type: "response.function_call_arguments.delta", call_id: "c2", delta: '{"b":' },
+      { type: "response.function_call_arguments.delta", call_id: "c1", delta: '1}' },
+      { type: "response.function_call_arguments.delta", item_id: "i2", delta: '2}' },
+      { type: "response.completed", response: { status: "completed" } },
+    ]);
+    const out = aggregateResponsesSseToOpenAI(raw, "m");
+    assert.equal(out.choices[0].message.tool_calls.length, 2);
+    assert.equal(out.choices[0].message.tool_calls[0].id, "c1");
+    assert.equal(out.choices[0].message.tool_calls[0].function.name, "tool1");
+    assert.equal(out.choices[0].message.tool_calls[0].function.arguments, '{"a":1}');
+    assert.equal(out.choices[0].message.tool_calls[1].id, "c2");
+    assert.equal(out.choices[0].message.tool_calls[1].function.name, "tool2");
+    assert.equal(out.choices[0].message.tool_calls[1].function.arguments, '{"b":2}');
+  });
   it("maps incomplete responses and defaults usage to zero", () => {
     const raw = sse([{ type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: "max_output_tokens" } } }]);
     const out = aggregateResponsesSseToOpenAI(raw, "m");
     assert.equal(out.choices[0].finish_reason, "length");
     assert.deepEqual(out.usage, { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
+  });
+});
+
+describe("responsesToolCallKey and responsesToolCallKeys", () => {
+  it("handles null, undefined and non-objects gracefully", () => {
+    assert.equal(responsesToolCallKey(null), "");
+    assert.equal(responsesToolCallKey(undefined), "");
+    assert.equal(responsesToolCallKey("string"), "");
+    assert.deepEqual(responsesToolCallKeys(null), []);
+    assert.deepEqual(responsesToolCallKeys(undefined), []);
+  });
+  it("resolves prioritized keys and eliminates duplicates", () => {
+    const ev = {
+      call_id: "c_ev",
+      item_id: "i_ev",
+      id: "id_ev",
+      item: { call_id: "c_item", id: "id_item" },
+    };
+    assert.equal(responsesToolCallKey(ev), "c_item");
+    assert.deepEqual(responsesToolCallKeys(ev), ["c_item", "c_ev", "i_ev", "id_item", "id_ev"]);
+  });
+  it("falls back to item_id and id when call_id is absent", () => {
+    assert.equal(responsesToolCallKey({ item_id: "item_xyz" }), "item_xyz");
+    assert.equal(responsesToolCallKey({ id: "id_xyz" }), "id_xyz");
+    assert.equal(responsesToolCallKey({ item: { id: "id_item" } }), "id_item");
+  });
+});
+
+describe("createUnifiedSseAggregator tool key synchronization", () => {
+  const sse = (evs) => evs.map((e) => `data: ${JSON.stringify(e)}`).join("\n");
+  it("synchronizes Responses tool keys when id != call_id and filters fingerprint tools", () => {
+    const agg = createUnifiedSseAggregator("test-model");
+    const raw = sse([
+      { type: "response.output_item.added", item: { type: "function_call", id: "item_r1", call_id: "call_r1", name: "search" } },
+      { type: "response.function_call_arguments.delta", item_id: "item_r1", delta: '{"query":' },
+      { type: "response.function_call_arguments.delta", call_id: "call_r1", delta: '"test"}' },
+      // Decoy fingerprint tool should be filtered
+      { type: "response.output_item.added", item: { type: "function_call", id: "item_decoy", call_id: "call_decoy", name: "bash" } },
+      { type: "response.function_call_arguments.delta", item_id: "item_decoy", delta: '{"command":"ls"}' },
+      { type: "response.completed", response: { status: "completed" } },
+    ]);
+    agg.pushText(raw);
+    const res = agg.result();
+    assert.equal(res.choices[0].finish_reason, "tool_calls");
+    assert.equal(res.choices[0].message.tool_calls.length, 1);
+    assert.equal(res.choices[0].message.tool_calls[0].id, "call_r1");
+    assert.equal(res.choices[0].message.tool_calls[0].function.name, "search");
+    assert.equal(res.choices[0].message.tool_calls[0].function.arguments, '{"query":"test"}');
   });
 });
 
@@ -407,6 +510,19 @@ describe("validateAnthropicMessagesBody", () => {
     assert.equal(validateAnthropicMessagesBody({ model: "m", messages: [], max_tokens: 0 }), null);
     assert.equal(validateAnthropicMessagesBody({ model: "m", messages: [{ role: "user", content: "hi" }], max_tokens: 5 }), null);
   });
+  it("rejects non-object messages in messages array", () => {
+    assert.match(validateAnthropicMessagesBody({ model: "m", messages: [null], max_tokens: 5 }), /Invalid message at index 0: expected object/);
+    assert.match(validateAnthropicMessagesBody({ model: "m", messages: [undefined], max_tokens: 5 }), /Invalid message at index 0: expected object/);
+    assert.match(validateAnthropicMessagesBody({ model: "m", messages: ["invalid"], max_tokens: 5 }), /Invalid message at index 0: expected object/);
+    assert.match(validateAnthropicMessagesBody({ model: "m", messages: [123], max_tokens: 5 }), /Invalid message at index 0: expected object/);
+    assert.match(validateAnthropicMessagesBody({ model: "m", messages: [[]], max_tokens: 5 }), /Invalid message at index 0: expected object/);
+  });
+  it("rejects messages with missing role or invalid content", () => {
+    assert.match(validateAnthropicMessagesBody({ model: "m", messages: [{ content: "hi" }], max_tokens: 5 }), /missing or invalid role/);
+    assert.match(validateAnthropicMessagesBody({ model: "m", messages: [{ role: "  ", content: "hi" }], max_tokens: 5 }), /missing or invalid role/);
+    assert.match(validateAnthropicMessagesBody({ model: "m", messages: [{ role: "user" }], max_tokens: 5 }), /missing required field 'content'/);
+    assert.match(validateAnthropicMessagesBody({ model: "m", messages: [{ role: "user", content: 123 }], max_tokens: 5 }), /content must be a string or array/);
+  });
 });
 
 describe("anthropicParamsToChat effort mapping", () => {
@@ -518,6 +634,21 @@ describe("anthropicToOpenAI gateway handling", () => {
     });
     assert.match(out.messages[0].content, /server_tool_use: web_search/);
   });
+  it("does not throw on null, undefined, or primitive messages or tools", () => {
+    const out = anthropicToOpenAI({
+      messages: [null, undefined, 42, "string", { role: "user", content: "valid" }],
+      tools: [null, undefined, "not_an_object", { name: "test_tool" }],
+    });
+    assert.equal(out.messages.length, 1);
+    assert.equal(out.messages[0].content, "valid");
+    assert.equal(out.tools.length, 1);
+    assert.equal(out.tools[0].function.name, "test_tool");
+  });
+  it("does not throw on null or non-object body", () => {
+    assert.deepEqual(anthropicToOpenAI(null), { messages: [], tools: undefined, params: {} });
+    assert.deepEqual(anthropicToOpenAI(undefined), { messages: [], tools: undefined, params: {} });
+    assert.deepEqual(anthropicToOpenAI("hello"), { messages: [], tools: undefined, params: {} });
+  });
 });
 
 describe("createAnthropicBlockTracker", () => {
@@ -604,5 +735,82 @@ describe("createAnthropicBlockTracker", () => {
       blocks.stopAll();
     });
     validateSequence(events);
+  });
+});
+
+describe("createChatToolTracker", () => {
+  it("handles sequential tool calls when upstream reuses index 0 without collapsing", () => {
+    const tracker = createChatToolTracker();
+    const call1 = tracker.processCall({ index: 0, id: "call_1", function: { name: "get_weather", arguments: '{"city":' } });
+    assert.equal(call1.id, "call_1");
+    assert.equal(call1.key, "tool:call_1");
+    assert.equal(call1.name, "get_weather");
+    assert.equal(call1.firstTimeSeen, true);
+    assert.equal(tracker.hasStartedTools(), true);
+
+    const delta1 = tracker.processCall({ index: 0, function: { arguments: '"Paris"}' } });
+    assert.equal(delta1.id, "call_1");
+    assert.equal(delta1.key, "tool:call_1");
+    assert.equal(delta1.firstTimeSeen, false);
+    assert.equal(delta1.arguments, '"Paris"}');
+
+    // Second sequential tool call reuses index 0 with a new id
+    const call2 = tracker.processCall({ index: 0, id: "call_2", function: { name: "get_time", arguments: '{"zone":' } });
+    assert.equal(call2.id, "call_2");
+    assert.equal(call2.key, "tool:call_2");
+    assert.equal(call2.name, "get_time");
+    assert.equal(call2.firstTimeSeen, true);
+
+    const delta2 = tracker.processCall({ index: 0, function: { arguments: '"UTC"}' } });
+    assert.equal(delta2.id, "call_2");
+    assert.equal(delta2.key, "tool:call_2");
+    assert.equal(delta2.firstTimeSeen, false);
+    assert.equal(delta2.arguments, '"UTC"}');
+
+    assert.equal(tracker.toolMap.size, 2);
+    assert.ok(tracker.toolMap.has("call_1"));
+    assert.ok(tracker.toolMap.has("call_2"));
+  });
+
+  it("handles parallel tool calls with interleaved chunks", () => {
+    const tracker = createChatToolTracker();
+    const t0 = tracker.processCall({ index: 0, id: "c0", function: { name: "toolA" } });
+    const t1 = tracker.processCall({ index: 1, id: "c1", function: { name: "toolB" } });
+    assert.equal(t0.id, "c0");
+    assert.equal(t1.id, "c1");
+
+    // Interleaved argument deltas
+    const d1 = tracker.processCall({ index: 1, function: { arguments: "b_chunk" } });
+    const d0 = tracker.processCall({ index: 0, function: { arguments: "a_chunk" } });
+    assert.equal(d1.id, "c1");
+    assert.equal(d1.key, "tool:c1");
+    assert.equal(d0.id, "c0");
+    assert.equal(d0.key, "tool:c0");
+  });
+
+  it("supports item_id as explicit tool identifier", () => {
+    const tracker = createChatToolTracker();
+    const res = tracker.processCall({ index: 0, item_id: "item_custom", function: { name: "custom_fn" } });
+    assert.equal(res.id, "item_custom");
+    assert.equal(res.key, "tool:item_custom");
+  });
+
+  it("detects fingerprint decoy tools and skips subsequent arguments", () => {
+    const tracker = createChatToolTracker();
+    const res1 = tracker.processCall({ index: 0, id: "decoy_1", function: { name: "bash" } });
+    assert.equal(res1.skipped, true);
+    assert.equal(tracker.hasStartedTools(), false);
+
+    const res2 = tracker.processCall({ index: 0, function: { arguments: "echo hello" } });
+    assert.equal(res2.skipped, true);
+    assert.equal(tracker.hasStartedTools(), false);
+  });
+
+  it("handles null, undefined and malformed calls gracefully", () => {
+    const tracker = createChatToolTracker();
+    assert.equal(tracker.processCall(null), null);
+    assert.equal(tracker.processCall(undefined), null);
+    assert.equal(tracker.processCall(42), null);
+    assert.equal(tracker.hasStartedTools(), false);
   });
 });

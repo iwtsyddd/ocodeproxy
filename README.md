@@ -15,7 +15,7 @@ SDK / Client (OpenAI / Anthropic) --> localhost:6446 --> opencode.ai /zen/v1
 
 ## Status
 
-Early development (`v0.1.1-t3`). The API, config, and behavior will change without notice. Not production-ready.
+Early development (`v0.1.2`). The API, config, and behavior will change without notice. Not production-ready.
 
 > **Stability warning.** OCodeProxy is experimental software under active development.
 > It is an unofficial gateway: upstream changes at `opencode.ai` can break it at
@@ -122,10 +122,10 @@ node server.mjs --port 8080
 | `ZEN_AUTH_MODE` | `public` | Upstream Zen auth mode, sent as `Authorization: Bearer ...` |
 | `ZEN_DIET` | `balanced` | Context optimization mode (`balanced`, `safe`, `aggressive`, `off`) |
 | `ZEN_TOOL_SLIM` | `""` (off) | Experimental tool-description slimming (`1` truncates long tool descriptions to their first sentence; may degrade tool selection) |
-| `FALLBACK_ATTEMPTS` | `3` | Models to try in fallback chain (`1-10`) |
+| `FALLBACK_ATTEMPTS` | `3` | Distinct models to try in fallback chain (`1-10`); `1` means a single attempt, never a same-model retry |
 | `FALLBACK_DELAY_MS` | `300` | Delay between fallbacks (`0-10000`) |
+| `BUFFERED_SSE_MAX_BYTES` | `20971520` (20MB) | Cap for buffered (non-stream) upstream SSE/JSON (`1MB-100MB`); exceeded responses return `413 buffer_limit_exceeded` instead of buffering unbounded RAM |
 | `OC_VERSION` | auto | Pinned `opencode/x.y.z` User-Agent version, refreshed from npm every 6h |
-| `PROXY_VERSION` | `16` | Reported in `/health` as `proxy_version` |
 | `AI_SDK_VER` / `BUN_VER` | `4.0.23` / `1.3.13` | User-Agent fingerprint parts |
 | `OPENCODE_CLIENT` / `OPENCODE_PROJECT` | `cli` / `global` | `x-opencode-*` headers |
 
@@ -245,7 +245,8 @@ tokens saved by optimization and the pre-diet tool-results share of context.
 - Repair (`lib/repair.mjs`): closes user-interrupted orphan tool calls with cancellation stubs, folds consecutive user messages (chat + Responses shapes).
 - ZenDiet (`lib/zendiet.mjs`, `lib/zendiet/*`): context governor (pressure calculation, sha256 deduplication with ANSI-normalized hashing, noise stripping with repetition collapse, huge-output emergency reduction, test/diff preservation, opt-in tool-description slimming).
 - Routing (`lib/models.mjs`): alias resolution, discontinued-model filter, `chat` vs `muse-spark* responses` partition.
-- Fallback (`lib/fallback.mjs`): candidate model list, buffered retry (`collectWithFallback`) and pre-headers stream failover (`tryStreamFallback`).
+- Fallback (`lib/fallback.mjs`): candidate model list, buffered retry (`collectWithFallback`) and pre-headers stream failover (`tryStreamFallback`, dropped if the client disconnects).
+- Buffered SSE (`lib/buffered.mjs`): incremental non-stream aggregation (chat + Responses event shapes) with a byte cap; only aggregated content plus a 64k error-detection head is retained, never the full raw payload.
 - Errors (`lib/errors.mjs`): Zen errors mapped to OpenAI / Anthropic shapes, network details sanitized.
 - IDs / keys (`lib/ids.mjs`, `lib/keys.mjs`): `ses_*` / `msg_*` ids, `ocp-` key generation and masking.
 
@@ -262,16 +263,17 @@ Why: classifier verdicts come from the upstream model server. This proxy's upstr
 
 Honest list of things that are stubbed, partial, or intentional hacks:
 
-- **Usage tokens are estimated.** Streaming `message_start`, non-streaming responses, and TUI traffic stats report estimated `input_tokens` based on request content and ZenDiet optimization. Streaming `output_tokens` is estimated as `ceil(chars/4)` (thinking + text + tool JSON). Aggregates report upstream usage when provided.
-- **`count_tokens` is a heuristic.** Character-length based (+85/image, +20/document), not a real tokenizer. Accepts Claude model ids (mapped to the default model for the 404 check).
-- **Mid-stream failures are masked.** After headers are sent, upstream errors/timeouts end the stream as a normal `stop` / `end_turn` instead of surfacing an error.
+- **Usage tokens are estimated.** Streaming `message_start`, non-streaming responses, and TUI traffic stats report estimated `input_tokens` based on request content and ZenDiet optimization, including the fingerprint decoy tools every upstream request carries. Streaming `output_tokens` is estimated as `ceil(chars/4)` (thinking + text + tool JSON). Aggregates report upstream usage when provided.
+- **`count_tokens` is a heuristic.** Character-length based (+85/image, +20/document), not a real tokenizer. Accepts gateway aliases and provider-routed Claude ids like other routes; any other unknown id 404s with a did-you-mean hint.
+- **Mid-stream failures abort the stream.** After headers are sent, an upstream error/timeout/empty-end tears down the client connection (destroyed socket, stats still recorded) instead of emitting a fake `stop` / `end_turn`. Clients see an error rather than truncated "success". Pre-headers failures still map to proper HTTP error responses, and scheduled stream-fallback retries are dropped if the client already disconnected.
 - **Gateway retry headers on buffered errors.** `retry-after` / `x-should-retry` / `anthropic-ratelimit-unified-*` forwarding applies to all buffered (non-streaming) error paths; post-headers streaming errors still can't carry them.
-- **Claude Code model mapping.** Unknown `*claude*` / `*anthropic*` model ids (Claude defaults, provider-prefixed ids, gateway aliases) resolve to the default model instead of 404. `/v1/models` advertises canonical `claude-*` aliases plus real ids; `?limit=` is honored. `max_tokens` is required per spec (`0` returns an empty pre-warm message). `output_config.effort` and `thinking: adaptive/enabled` map to `reasoning_effort`; `thinking`/`redacted_thinking` blocks are dropped before upstream (no preserved-thinking check against Zen); the `x-anthropic-billing-header` attribution block is stripped before folding `system` into upstream `instructions`. Streaming translators emit each content block exactly once with sequential indices (thinking only when reasoning arrives before any text/tools, otherwise token-counted) so Claude Code never sees a malformed event sequence.
+- **Fallback retries bill upstream.** Every fallback attempt resends the full prompt, so one user request can bill 2–3× upstream on 429/5xx. Non-retryable statuses (e.g. 400) are never retried, and the same model is never retried twice in a chain.
+- **Claude Code model mapping.** Only exact gateway aliases (`claude-sonnet-4-5`, `claude-opus-4-8`, …) and provider-routed ids (`bedrock/…`, `vertex_ai/…`) resolve to the default model. Any other unknown id — including bare `claude-*` typos — 404s with a did-you-mean hint instead of silently running the wrong model. `/v1/models` advertises canonical `claude-*` aliases plus real ids; `?limit=` is honored. `max_tokens` is required per spec (`0` returns an empty pre-warm message). `output_config.effort` and `thinking: adaptive/enabled` map to `reasoning_effort`; `thinking`/`redacted_thinking` blocks are dropped before upstream (no preserved-thinking check against Zen); the `x-anthropic-billing-header` attribution block is stripped before folding `system` into upstream `instructions`. Streaming translators emit each content block exactly once with sequential indices (thinking only when reasoning arrives before any text/tools, otherwise token-counted) so Claude Code never sees a malformed event sequence.
 - **Decoy tools.** Every upstream request injects `bash` / `glob` / `grep` / `read` fingerprint tools that are stripped from outputs. Upstream behavior may change if Zen starts validating these.
 - **Model list is filtered.** Zen inventory is the source of truth; `DISCONTINUED_MODELS` stays authoritative for exclusions. Free detection is name-based (`*free*`, `big-pickle`) plus cost-based (`cost.input/output == 0` from the models.dev catalog), so suffixless free models are kept when Zen serves them. models.dev also provides `context_window` / `max_output_tokens` / `description` for `/v1/models`; `status: deprecated` there is informational only and never filters. Without metadata (fetch failed, disabled via `MODELS_DEV_URL=""`), the gateway degrades to name-based behavior.
 - **Upstream coupling.** All traffic goes to `opencode.ai/zen/v1/*` with a forged `opencode/...` User-Agent. Upstream changes can break the proxy at any time.
-- **Tests are unit-only.** 203 tests cover `lib/` converters, errors, models, catalog, fallback, repair, and zendiet. `server.mjs` routes have no integration tests.
-- **Intentional spec deviations (Anthropic path).** `max_tokens: 0` returns an empty pre-warm message without an upstream call (extension, not Anthropic behavior). Attribution detection matches any leading `system` text containing both `cc_version=` and `cch=` — a `system` prompt that merely mentions those substrings alongside real instructions is dropped as a whole. `thinking: between_tools` maps to `reasoning_effort: none`.
+- **Tests are unit-only.** 337 tests cover `lib/` converters, errors, models, catalog, fallback, buffered SSE, streaming SSE line splitter, session store, repair, and zendiet. `server.mjs` routes have no integration tests.
+- **Intentional spec deviations (Anthropic path).** `max_tokens: 0` returns an empty pre-warm message without an upstream call (extension, not Anthropic behavior). Attribution detection matches any leading `system` text containing both `cc_version=` and `cch=` — a `system` prompt that merely mentions those substrings alongside real instructions is dropped as a whole. `thinking: between_tools` maps to `reasoning_effort: none`. Buffered (non-stream) upstream payloads larger than `BUFFERED_SSE_MAX_BYTES` return `413 buffer_limit_exceeded` instead of buffering unbounded RAM. Streaming SSE keeps only one incomplete line (1MB cap): exceeding it returns `413 buffer_limit_exceeded` before headers, or aborts the stream after headers.
 - **Interrupted sessions are repaired.** User-cancelled tool calls leave orphan `tool_use` blocks that strict upstreams reject with `400 invalid parameters`. The gateway auto-closes each orphan with a `[Tool execution was cancelled or rejected by user]` stub and folds runs of consecutive `user` messages into one, before diet/forwarding. This repair always runs (independent of ZenDiet mode) because unrepaired requests cannot succeed upstream.
 - **Tool slimming is experimental.** `ZEN_TOOL_SLIM=1` (or the Settings toggle) shortens tool descriptions over 300 chars to their first sentence. Names, parameters and schemas are never touched and tools are never dropped, but the model may select tools less accurately. Off by default; toggle live without restart.
 
@@ -286,6 +288,9 @@ OCodeProxy/
 │   ├── models.mjs       # discovery, alias, fallback list
 │   ├── errors.mjs       # upstream error mapping
 │   ├── fallback.mjs     # collect / stream fallback orchestration
+│   ├── buffered.mjs     # incremental buffered SSE + byte cap
+│   ├── sse.mjs         # streaming SSE line splitter (offset search + line cap)
+│   ├── session.mjs      # bounded LRU session store + TTL sweep
 │   ├── keys.mjs         # key gen / mask / validate
 │   ├── ids.mjs          # session/message ids
 │   ├── content.mjs      # content helpers + token estimate
@@ -311,9 +316,12 @@ npm test
 | `catalog.test.mjs` | models.dev parsing, free-by-cost, alias fallback |
 | `errors.test.mjs` | Zen to OpenAI / Anthropic mapping |
 | `fallback.test.mjs` | Retry orchestration |
+| `buffered.test.mjs` | Incremental SSE aggregation, byte cap, split-chunk safety, bounded aux fetch |
+| `sse.test.mjs` | Streaming line splitter (boundaries, CRLF, multibyte, line cap) |
 | `ids-keys.test.mjs` | ID format, key validation |
 | `sampling.test.mjs` | Sampling / conversion edge cases |
-| `zendiet.test.mjs` | Safety invariants, pressure, dedup, tool reducers |
+| `session.test.mjs` | Bounded LRU session store (TTL expiry, LRU cap, sweep) |
+| `zendiet.test.mjs` | Safety invariants, pressure, dedup, tool reducers, failure hard-caps |
 | `zendiet-tools.test.mjs` | Tool-description slimming (shapes, thresholds, opt-in wiring) |
 | `repair.test.mjs` | Orphan tool-call stubs, user-message folding (chat + Responses shapes) |
 
@@ -324,6 +332,11 @@ Never commit real keys: `api-keys.json`, `models.json`, `proxy-config.json`, and
 - Keys file is written with `0600`, atomically via temp file + rename.
 - Auth uses constant-time comparison.
 - JSON body limit `10mb`, with protocol-correct `413` / `400` shapes.
+- Bounded per-user session store (1000 LRU entries cap, 30 min TTL, 5 min periodic sweep) prevents memory exhaustion from key spam.
+- Auxiliary service fetches (models.dev metadata, opencode models discovery, npm version check) capped by `AUX_FETCH_MAX_BYTES` (default 10MB) with immediate socket destruction on cap exceeded to protect against OOM from rogue or corrupted upstreams.
+- Buffered upstream SSE/JSON capped by `BUFFERED_SSE_MAX_BYTES` (default 20MB); exceeded buffered responses return `413 buffer_limit_exceeded`.
+- Streaming upstream SSE keeps only one incomplete line (1MB cap); a giant line without newlines returns `413 buffer_limit_exceeded` before headers, or aborts the stream after headers.
+- ZenDiet tool output reducers enforce hard caps (`DEFAULT_FAILURE_MAX_CHARS` = 10,000, emergency `HUGE_TOOL_CHARS` = 8,000) on all tool results, including failure traces, massive git diffs, and test outputs. Megabytes of error dumps (e.g. `cat huge.log` with errors) can never bypass compression into upstream context.
 - Upstream network errors are sanitized — no internal addresses or stacks leak to clients.
 
 ## License

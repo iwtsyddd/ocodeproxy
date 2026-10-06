@@ -20,6 +20,7 @@ proxy-config.json
 
 # local scratch (never publish)
 *-tmp.*
+release/
 zendiet.md
 
 # project-internal (not for publish)

@@ -45,6 +45,9 @@ import {
   reduceFileReadOutput,
   reduceShellOutput,
   reduceToolOutput,
+  hardCapText,
+  DEFAULT_FAILURE_MAX_CHARS,
+  DEFAULT_DIFF_MAX_CHARS,
 } from "../lib/zendiet/reducers.mjs";
 
 describe("ZenDiet Safety & Tier 0 Invariants", () => {
@@ -665,3 +668,149 @@ describe("ZenDiet Repetition Collapse & Blob Fallback", () => {
     assert.ok(reduced.length < blob.length);
   });
 });
+
+describe("ZenDiet Failure Hard-Cap & Output Bounding", () => {
+  it("hardCapText handles negatives safely", () => {
+    assert.equal(hardCapText(null), null);
+    assert.equal(hardCapText(undefined), undefined);
+    assert.equal(hardCapText(""), "");
+    assert.equal(hardCapText(123), 123);
+  });
+
+  it("hardCapText leaves text under limit untouched", () => {
+    const text = "short trace under limit\nError: something broke";
+    assert.equal(hardCapText(text, 1000), text);
+  });
+
+  it("hardCapText enforces exact upper bound and head-tail split on large text", () => {
+    const large = Array.from({ length: 400 }, (_, i) => `line ${i}: some payload content`).join("\n");
+    const capped = hardCapText(large, 5000);
+    assert.ok(capped.length <= 5000);
+    assert.ok(capped.length > 2000);
+    assert.match(capped, /\[\.\.\. ZenDiet: \d+ chars omitted/);
+    assert.ok(capped.startsWith("line 0:"));
+    assert.ok(capped.includes("line 399:"));
+  });
+
+  it("hardCapText preserves failure marker when present in head or tail", () => {
+    const headError = `Error: startup configuration missing\n${"x".repeat(15000)}`;
+    const cappedHead = hardCapText(headError, 6000);
+    assert.ok(cappedHead.length <= 6000);
+    assert.ok(cappedHead.includes("Error: startup configuration missing"));
+
+    const tailError = `${"y".repeat(15000)}\nFATAL: server crashed at port 8080`;
+    const cappedTail = hardCapText(tailError, 6000);
+    assert.ok(cappedTail.length <= 6000);
+    assert.ok(cappedTail.includes("FATAL: server crashed at port 8080"));
+  });
+
+  it("hardCapText preserves failure marker buried deep in the middle of massive trace", () => {
+    const hugePrefix = Array.from({ length: 1500 }, (_, i) => `startup step ${i} completed ok`).join("\n");
+    const errorBlock = "TypeError: Cannot read properties of null (reading 'listen')\n    at startServer (server.js:42:15)\n    at init (app.js:10:3)";
+    const hugeSuffix = Array.from({ length: 1500 }, (_, i) => `shutdown step ${i} completed ok`).join("\n");
+    const massiveMiddleError = `${hugePrefix}\n${errorBlock}\n${hugeSuffix}`;
+    assert.ok(massiveMiddleError.length > 80000);
+
+    const capped = hardCapText(massiveMiddleError, 8000);
+    assert.ok(capped.length <= 8000);
+    assert.ok(capped.includes("TypeError: Cannot read properties of null"));
+    assert.ok(capped.includes("at startServer"));
+    assert.match(capped, /\[ZenDiet: error context preserved\]/);
+    assert.match(capped, /\[\.\.\. ZenDiet: \d+ chars omitted \(failure output hard-capped\) \.\.\.\]/);
+  });
+
+  it("hardCapText bounds single giant line with no newlines without throwing", () => {
+    const noNewlines = `Error: ${"a".repeat(30000)}`;
+    const capped = hardCapText(noNewlines, 4000);
+    assert.ok(capped.length <= 4000);
+    assert.ok(capped.includes("Error:"));
+    assert.match(capped, /chars omitted/);
+  });
+
+  it("reduceShellOutput caps massive failure trace while preserving short failures", () => {
+    const shortFailure = "npm ERR! code ENOENT\nnpm ERR! syscall open\nError: file not found";
+    assert.equal(reduceShellOutput(shortFailure), shortFailure);
+
+    const massiveFailure = `Error: build failed\n${Array.from({ length: 2500 }, (_, i) => `  at step_${i} (/app/src/worker_${i}.js:${i}:14)`).join("\n")}`;
+    assert.ok(massiveFailure.length > 50000);
+    const reduced = reduceShellOutput(massiveFailure);
+    assert.ok(reduced.length <= DEFAULT_FAILURE_MAX_CHARS);
+    assert.ok(reduced.includes("Error: build failed"));
+    assert.match(reduced, /\[\.\.\. ZenDiet:/);
+  });
+
+  it("reduceShellOutput respects explicit maxFailureChars option", () => {
+    const failure = `Error: panic\n${Array.from({ length: 300 }, (_, i) => `log line ${i} detailing subsystem state ${i}`).join("\n")}`;
+    const reduced = reduceShellOutput(failure, { maxFailureChars: 3000 });
+    assert.ok(reduced.length <= 3000);
+    assert.ok(reduced.includes("Error: panic"));
+  });
+
+  it("reduceDiffOutput hard-caps giant diffs with only additions and deletions", () => {
+    const giantDiff = Array.from({ length: 2000 }, (_, i) => `+const row_${i} = generateNewRecordData(${i});`).join("\n");
+    assert.ok(giantDiff.length > 70000);
+    const reduced = reduceDiffOutput(giantDiff);
+    assert.ok(reduced.length <= DEFAULT_DIFF_MAX_CHARS);
+    assert.ok(reduced.length < giantDiff.length);
+    assert.match(reduced, /\[\.\.\. ZenDiet: \d+ chars omitted \(diff output hard-capped\) \.\.\.\]/);
+  });
+
+  it("reduceTestOutput hard-caps massive failing test suites with thousands of failures", () => {
+    const massiveTestFails = Array.from({ length: 1500 }, (_, i) => `FAIL src/test_${i}.js\n  AssertionError: expected ${i} to equal ${i + 1}\n    at runTest (test_${i}.js:20:5)`).join("\n");
+    assert.ok(massiveTestFails.length > 80000);
+    const reduced = reduceTestOutput(massiveTestFails);
+    assert.ok(reduced.length <= DEFAULT_FAILURE_MAX_CHARS);
+    assert.match(reduced, /\[ZenDiet: test failures preserved\]/);
+    assert.match(reduced, /\[\.\.\. ZenDiet:/);
+  });
+
+  it("reduceToolOutput generic default hard-caps massive failure output", () => {
+    const genericFailure = `command returned 1\n${"dump row\n".repeat(2000)}`;
+    const reduced = reduceToolOutput(genericFailure, "custom-runner");
+    assert.ok(reduced.length <= DEFAULT_FAILURE_MAX_CHARS);
+    assert.ok(reduced.includes("command returned 1"));
+  });
+
+  it("emergency pass in safe mode reduces 5MB failure output in active turn", () => {
+    const massiveTrace = `Command exited with code 1\n${"debug info trace log line\n".repeat(4000)}`;
+    assert.ok(massiveTrace.length > 80000);
+    const req = {
+      messages: [
+        { role: "user", content: "cat huge.log" },
+        { role: "assistant", tool_calls: [{ id: "c1", function: { name: "cat" } }] },
+        { role: "tool", tool_call_id: "c1", content: massiveTrace },
+      ],
+    };
+    const res = optimizeContext(req, { mode: "safe", contextWindow: 128000 });
+    assert.equal(res.changed, true);
+    assert.ok(res.decisions.some((d) => d.includes("emergency: reduced 1 huge tool results")));
+    const output = res.request.messages[2].content;
+    assert.ok(output.length <= HUGE_TOOL_CHARS);
+    assert.ok(output.includes("Command exited with code 1"));
+  });
+
+  it("emergency pass reduces massive git diff in Anthropic tool_result array format", () => {
+    const giantDiff = Array.from({ length: 1500 }, (_, i) => `+added feature line ${i} with extra padding`).join("\n");
+    assert.ok(giantDiff.length > 50000);
+    const req = {
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tu_diff",
+              content: [{ type: "text", text: giantDiff }],
+            },
+          ],
+        },
+      ],
+    };
+    const res = optimizeContext(req, { mode: "safe", contextWindow: 128000 });
+    assert.equal(res.changed, true);
+    const textOut = res.request.messages[0].content[0].content[0].text;
+    assert.ok(textOut.length <= HUGE_TOOL_CHARS);
+    assert.match(textOut, /\[\.\.\. ZenDiet:/);
+  });
+});
+

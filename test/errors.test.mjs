@@ -8,6 +8,7 @@ import {
   retryAfterMs,
   isRetryableUpstreamStatus,
   gatewayRetryHeaders,
+  asyncHandler,
 } from "../lib/errors.mjs";
 
 describe("responsesErrorStatus", () => {
@@ -71,6 +72,43 @@ describe("detectUpstreamError", () => {
     assert.deepEqual(detectUpstreamError('{"partial":').needMore, true);
     assert.deepEqual(detectUpstreamError("<html>" + "x".repeat(70000)).isStream, true);
   });
+  it("handles whitespace, null and non-string inputs", () => {
+    assert.deepEqual(detectUpstreamError(null).needMore, true);
+    assert.deepEqual(detectUpstreamError(undefined).needMore, true);
+    assert.deepEqual(detectUpstreamError("   \n\t  ").needMore, true);
+    assert.deepEqual(detectUpstreamError(123).isStream, true);
+    assert.deepEqual(detectUpstreamError(Buffer.from("")).needMore, true);
+    const bufErr = detectUpstreamError(Buffer.from('{"error":{"message":"x"}}'));
+    assert.equal(bufErr.isStream, false);
+    assert.equal(bufErr.parsed.error.message, "x");
+  });
+  it("ignores surrounding whitespace for errors", () => {
+    const err = detectUpstreamError('  {"error":{"message":"x"}}  \n');
+    assert.equal(err.isStream, false);
+    assert.equal(err.parsed.error.message, "x");
+    assert.deepEqual(detectUpstreamError("  data: {}").isStream, true);
+  });
+  it("prefers explicit error shapes over derived rate-limit match", () => {
+    const explicit = detectUpstreamError('{"error":{"message":"boom"}}');
+    assert.equal(explicit.isStream, false);
+    const byType = detectUpstreamError('{"type":"error","message":"bad"}');
+    assert.equal(byType.isStream, false);
+    const byRegex = detectUpstreamError('{"message":"rate_limit hit"}');
+    assert.equal(byRegex.isStream, false);
+    assert.equal(byRegex.parsed.message, "rate_limit hit");
+    assert.deepEqual(detectUpstreamError('{"ok":true}').isStream, true);
+  });
+  it("prefers SSE marker over JSON-looking prefix", () => {
+    assert.deepEqual(detectUpstreamError('{ "a":1 }\nzzz\ndata: foo').isStream, true);
+    assert.deepEqual(detectUpstreamError(": ping\n\ndata: {}").isStream, true);
+  });
+  it("waits for closing brace instead of parsing incomplete JSON", () => {
+    assert.deepEqual(detectUpstreamError('{"error":"' + "x".repeat(9000)).needMore, true);
+    const bigErr = '{"error":{"message":"' + "y".repeat(10000) + '"}}';
+    const done = detectUpstreamError(bigErr);
+    assert.equal(done.isStream, false);
+    assert.match(done.parsed.error.message, /^y+$/);
+  });
 });
 
 describe("retryAfterMs", () => {
@@ -113,3 +151,48 @@ describe("gatewayRetryHeaders", () => {
     assert.equal(out["anthropic-ratelimit-unified-limit"], "100");
   });
 });
+
+describe("asyncHandler", () => {
+  it("rejects non-function input with TypeError", () => {
+    assert.throws(() => asyncHandler(null), TypeError);
+    assert.throws(() => asyncHandler(undefined), TypeError);
+    assert.throws(() => asyncHandler(123), TypeError);
+  });
+
+  it("passes async rejection to next(err)", async () => {
+    let captured = null;
+    const next = (err) => { captured = err; };
+    const handler = asyncHandler(async () => {
+      throw new Error("async explosion");
+    });
+    handler({}, {}, next);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.ok(captured instanceof Error);
+    assert.equal(captured.message, "async explosion");
+  });
+
+  it("passes sync throw to next(err)", () => {
+    let captured = null;
+    const next = (err) => { captured = err; };
+    const handler = asyncHandler(() => {
+      throw new Error("sync explosion");
+    });
+    handler({}, {}, next);
+    assert.ok(captured instanceof Error);
+    assert.equal(captured.message, "sync explosion");
+  });
+
+  it("does not call next when async route completes normally", async () => {
+    let called = false;
+    const next = () => { called = true; };
+    const handler = asyncHandler(async (_req, res) => {
+      res.status = 200;
+    });
+    const fakeRes = {};
+    handler({}, fakeRes, next);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(called, false);
+    assert.equal(fakeRes.status, 200);
+  });
+});
+
