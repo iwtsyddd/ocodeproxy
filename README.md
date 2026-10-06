@@ -15,7 +15,7 @@ SDK / Client (OpenAI / Anthropic) --> localhost:6446 --> opencode.ai /zen/v1
 
 ## Status
 
-Early development (`v0.1.2`). The API, config, and behavior will change without notice. Not production-ready.
+Early development (`v0.1.2-t1`). The API, config, and behavior will change without notice. Not production-ready.
 
 > **Stability warning.** OCodeProxy is experimental software under active development.
 > It is an unofficial gateway: upstream changes at `opencode.ai` can break it at

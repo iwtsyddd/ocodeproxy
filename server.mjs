@@ -98,7 +98,7 @@ if (process.stdout.isTTY) {
   process.stdout.write("\x1b]0;OCodeProxy\x07");
 }
 
-const TUI_VERSION = "v0.1.2";
+const TUI_VERSION = "v0.1.2-t1";
 const FALLBACK_OC_VERSION = "1.18.31";
 let ocVersion = process.env.OC_VERSION || FALLBACK_OC_VERSION;
 let lastOcVersionCheck = 0;
