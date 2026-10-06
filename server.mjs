@@ -1182,13 +1182,13 @@ function pipeZenResponses(zenOpts, body, requestedModel, res, extra = {}) {
 
   function finish(finishReason) {
     if (finished) return;
-    finished = true;
     try {
       extra.onDone?.(Math.ceil(outChars / 4));
     } catch {}
     sendHeaders();
     sendDelta({}, finishReason);
     safeWrite(res, "data: [DONE]\n\n");
+    finished = true;
     safeEnd(res);
   }
 
@@ -1464,7 +1464,6 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens, ext
 
   function closeBlocksAndStop(stopReason) {
     if (finished) return;
-    finished = true;
     try {
       blocks.stopAll();
     } catch {}
@@ -1473,6 +1472,7 @@ function pipeZenResponsesAsAnthropic(zenOpts, body, model, res, inputTokens, ext
     } catch {}
     sendSSE("message_delta", { type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: outputTokens } });
     sendSSE("message_stop", { type: "message_stop" });
+    finished = true;
     safeEnd(res);
   }
 
@@ -1768,12 +1768,12 @@ function pipeZenResponsesPassthrough(zenOpts, body, requestedModel, res, extra =
 
   function finish(completed) {
     if (finished) return;
-    finished = true;
     try {
       extra.onDone?.(Math.ceil(outChars / 4));
     } catch {}
     sendHeaders();
     safeWrite(res, `data: ${JSON.stringify({ type: "response.completed", response: completed })}\n\n`);
+    finished = true;
     safeEnd(res);
   }
 
@@ -1938,7 +1938,6 @@ function pipeChatAsResponses(zenOpts, body, requestedModel, res, extra = {}) {
 
   function finish(status = "completed") {
     if (finished) return;
-    finished = true;
     try {
       const outTok = usage && Number.isFinite(usage.completion_tokens) ? usage.completion_tokens : 0;
       const inTok = usage && Number.isFinite(usage.prompt_tokens) ? usage.prompt_tokens : (extra?.inTokens || 0);
@@ -1948,6 +1947,7 @@ function pipeChatAsResponses(zenOpts, body, requestedModel, res, extra = {}) {
     } catch {}
     sendHeaders();
     safeWrite(res, `data: ${JSON.stringify({ type: "response.completed", response: { id: respId, model: requestedModel, status, usage: usage ? { input_tokens: usage.prompt_tokens ?? 0, output_tokens: usage.completion_tokens ?? 0, total_tokens: usage.total_tokens ?? 0 } : undefined } })}\n\n`);
+    finished = true;
     safeEnd(res);
   }
 
@@ -2124,6 +2124,7 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
   let finished = false;
   let firstChunkHandled = false;
   let outChars = 0;
+  let seenGracefulEnd = false;
 
   function doneStreaming() {
     if (finished) return;
@@ -2131,6 +2132,20 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
     try {
       extra.onDone?.(Math.ceil(outChars / 4));
     } catch {}
+  }
+
+  // Upstream failure after streaming started: record stats, then tear the
+  // socket instead of faking a normal end the agent would chat on.
+  function abort() {
+    if (finished) return;
+    finished = true;
+    try {
+      extra.onDone?.(Math.ceil(outChars / 4));
+    } catch {}
+    try {
+      req.destroy();
+    } catch {}
+    abortClientStream(res);
   }
 
   function sendHeaders() {
@@ -2155,15 +2170,15 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
         lines = splitter.push(chunk);
       } catch (e) {
         if (e?.code === "buffer_limit_exceeded") {
-          finished = true;
-          try { zenRes.resume(); } catch {}
-          try { req.destroy(); } catch {}
           if (!headersSent && !res.headersSent && !res.writableEnded) {
+            finished = true;
+            try { zenRes.resume(); } catch {}
+            try { req.destroy(); } catch {}
             const mapped = mapZenError(413, { message: e.message }, "openai");
             applyGatewayHeaders(res, zenRes.headers, mapped.status);
             res.status(mapped.status).json(mapped.body);
-          } else if (!res.writableEnded) {
-            try { res.end(); } catch {}
+          } else {
+            try { abort(); } catch {}
           }
           return;
         }
@@ -2195,19 +2210,19 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
             } catch {}
             return;
           }
-          finished = true;
-          try {
-            zenRes.resume();
-          } catch {}
-          try {
-            req.destroy();
-          } catch {}
           if (!res.headersSent && !res.writableEnded) {
+            finished = true;
+            try {
+              zenRes.resume();
+            } catch {}
+            try {
+              req.destroy();
+            } catch {}
             applyGatewayHeaders(res, zenRes.headers, mapped.status);
             res.status(mapped.status).json(mapped.body);
-          } else if (!res.writableEnded) {
+          } else {
             try {
-              res.end();
+              abort();
             } catch {}
           }
           return;
@@ -2226,12 +2241,18 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
           continue;
         }
         const payload = line.slice(6).trim();
-        if (!payload || payload === "[DONE]") {
+        if (payload === "[DONE]") {
+          seenGracefulEnd = true;
+          safeWrite(res, line + "\n\n");
+          continue;
+        }
+        if (!payload) {
           safeWrite(res, line + "\n\n");
           continue;
         }
         try {
           const parsed = JSON.parse(payload);
+          if (parsed.choices?.[0]?.finish_reason != null) seenGracefulEnd = true;
           const delta = parsed.choices?.[0]?.delta;
           if (delta?.tool_calls) {
             delta.tool_calls = delta.tool_calls.filter(
@@ -2264,8 +2285,16 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
         return;
       }
       if (headersSent && !finished && !res.writableEnded) {
-        doneStreaming();
-        res.end();
+        if (seenGracefulEnd) {
+          doneStreaming();
+          try {
+            res.end();
+          } catch {}
+        } else {
+          try {
+            abort();
+          } catch {}
+        }
       }
     });
 
@@ -2280,9 +2309,8 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
         applyGatewayHeaders(res, undefined, mapped.status);
         res.status(mapped.status).json(mapped.body);
       } else if (!finished && !res.writableEnded) {
-        doneStreaming();
         try {
-          res.end();
+          abort();
         } catch {}
       }
     });
@@ -2296,9 +2324,8 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
       applyGatewayHeaders(res, undefined, mapped.status);
       res.status(mapped.status).json(mapped.body);
     } else if (!finished && res.writableEnded === false) {
-      doneStreaming();
       try {
-        res.end();
+        abort();
       } catch {}
     }
   });
@@ -2312,9 +2339,8 @@ function pipeZenResponse(zenOpts, body, stream, res, extra = {}) {
       applyGatewayHeaders(res, undefined, mapped.status);
       res.status(mapped.status).json(mapped.body);
     } else if (!finished) {
-      finished = true;
       try {
-        res.end();
+        abort();
       } catch {}
     }
   });
