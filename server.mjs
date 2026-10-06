@@ -89,6 +89,7 @@ import {
 } from "./lib/sse.mjs";
 import { repairChatMessages, repairResponsesInput } from "./lib/repair.mjs";
 import { createSessionStore, DEFAULT_SESSION_SWEEP_INTERVAL_MS } from "./lib/session.mjs";
+import { optimizeContext, estimateRequestTokens } from "./lib/zendiet.mjs";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
